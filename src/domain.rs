@@ -1,28 +1,56 @@
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{Placement, Resource, lifecycle::Control, reference::Entry};
 
+type ResourceKey<R> = <<R as Resource>::Placement as Placement<R>>::Key;
+type RegistryEntries<R> = HashMap<ResourceKey<R>, Arc<RegistrySlot<R>>>;
+
 pub(crate) struct Registry<R: Resource> {
-    pub(crate) entries: HashMap<<<R as Resource>::Placement as Placement<R>>::Key, Weak<Entry<R>>>,
+    pub(crate) entries: Mutex<RegistryEntries<R>>,
+}
+
+pub(crate) struct RegistrySlot<R: Resource> {
+    pub(crate) entry: Mutex<std::sync::Weak<Entry<R>>>,
+    pub(crate) generation: std::sync::atomic::AtomicU64,
 }
 
 impl<R: Resource> Default for Registry<R> {
     fn default() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Mutex::new(HashMap::new()),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DomainPhase {
+    Running,
+    ShuttingDown,
+    Terminated,
+}
+
+struct Supervisor {
+    phase: DomainPhase,
+    next_task: u64,
+    tasks: HashMap<u64, ManagedTask>,
+}
+
+struct ManagedTask {
+    control: Arc<Control>,
+    abort: tokio::task::AbortHandle,
+}
+
 pub(crate) struct Domain {
-    pub(crate) registries: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
-    controls: Mutex<Vec<Weak<Control>>>,
+    registries: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    supervisor: Mutex<Supervisor>,
+    quiescent: Notify,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -30,25 +58,114 @@ impl Domain {
     pub(crate) fn new() -> Self {
         Self {
             registries: Mutex::new(HashMap::new()),
-            controls: Mutex::new(Vec::new()),
+            supervisor: Mutex::new(Supervisor {
+                phase: DomainPhase::Running,
+                next_task: 0,
+                tasks: HashMap::new(),
+            }),
+            quiescent: Notify::new(),
             shutdown: CancellationToken::new(),
         }
     }
 
-    pub(crate) fn track(&self, control: &Arc<Control>) {
-        self.controls.lock().unwrap().push(Arc::downgrade(control));
+    pub(crate) fn registry<R: Resource>(&self) -> Arc<Registry<R>> {
+        let mut registries = self.registries.lock().unwrap();
+        registries
+            .entry(TypeId::of::<R>())
+            .or_insert_with(|| Box::new(Arc::new(Registry::<R>::default())))
+            .downcast_ref::<Arc<Registry<R>>>()
+            .expect("a resource type has exactly one registry type")
+            .clone()
     }
 
-    pub(crate) fn shutdown(&self) {
-        self.shutdown.cancel();
-        let mut controls = self.controls.lock().unwrap();
-        controls.retain(|weak| {
-            if let Some(control) = weak.upgrade() {
-                control.cancel();
+    /// Atomically admits and activates a task on the running side of shutdown.
+    pub(crate) fn register(
+        &self,
+        control: Arc<Control>,
+        abort: tokio::task::AbortHandle,
+    ) -> Option<u64> {
+        let mut supervisor = self.supervisor.lock().unwrap();
+        if supervisor.phase != DomainPhase::Running || !control.activate() {
+            return None;
+        }
+        let id = supervisor.next_task;
+        supervisor.next_task += 1;
+        supervisor.tasks.insert(id, ManagedTask { control, abort });
+        Some(id)
+    }
+
+    pub(crate) fn task_finished(&self, id: u64) {
+        let terminated = {
+            let mut supervisor = self.supervisor.lock().unwrap();
+            supervisor.tasks.remove(&id);
+            if supervisor.phase == DomainPhase::ShuttingDown && supervisor.tasks.is_empty() {
+                supervisor.phase = DomainPhase::Terminated;
                 true
             } else {
                 false
             }
-        });
+        };
+        if terminated {
+            self.quiescent.notify_waiters();
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let controls = {
+            let mut supervisor = self.supervisor.lock().unwrap();
+            if supervisor.phase == DomainPhase::Terminated {
+                return;
+            }
+            supervisor.phase = DomainPhase::ShuttingDown;
+            self.shutdown.cancel();
+            if supervisor.tasks.is_empty() {
+                supervisor.phase = DomainPhase::Terminated;
+                self.quiescent.notify_waiters();
+            }
+            supervisor
+                .tasks
+                .values()
+                .map(|task| task.control.clone())
+                .collect::<Vec<_>>()
+        };
+        for control in controls {
+            control.cancel();
+        }
+    }
+
+    pub(crate) async fn terminate(&self) {
+        self.cancel();
+        let aborts = self
+            .supervisor
+            .lock()
+            .unwrap()
+            .tasks
+            .values()
+            .map(|task| task.abort.clone())
+            .collect::<Vec<_>>();
+        for abort in aborts {
+            abort.abort();
+        }
+        self.shutdown().await;
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.supervisor.lock().unwrap().phase == DomainPhase::Running
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.cancel();
+        loop {
+            let notified = self.quiescent.notified();
+            if self.supervisor.lock().unwrap().phase == DomainPhase::Terminated {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_tasks(&self) -> usize {
+        self.supervisor.lock().unwrap().tasks.len()
     }
 }

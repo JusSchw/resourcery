@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
+    Starting,
     Active,
     Cancelling,
     Finished,
@@ -24,10 +25,19 @@ impl Control {
         Self {
             lifecycle: Mutex::new(Lifecycle {
                 leases: 1,
-                phase: Phase::Active,
+                phase: Phase::Starting,
             }),
             cancellation: CancellationToken::new(),
         }
+    }
+
+    pub(crate) fn activate(&self) -> bool {
+        let mut state = self.lifecycle.lock().unwrap();
+        if state.phase != Phase::Starting {
+            return false;
+        }
+        state.phase = Phase::Active;
+        true
     }
 
     pub(crate) fn acquire(&self) -> bool {
@@ -41,7 +51,10 @@ impl Control {
 
     pub(crate) fn clone_lease(&self) {
         let mut state = self.lifecycle.lock().unwrap();
-        assert!(state.leases > 0, "an existing resource lease must be live");
+        assert!(
+            state.leases > 0 && state.phase == Phase::Active,
+            "new leases may only be created for an active resource"
+        );
         state.leases += 1;
     }
 
@@ -49,7 +62,7 @@ impl Control {
         let cancel = {
             let mut state = self.lifecycle.lock().unwrap();
             state.leases -= 1;
-            if state.leases == 0 && state.phase == Phase::Active {
+            if state.leases == 0 && matches!(state.phase, Phase::Starting | Phase::Active) {
                 state.phase = Phase::Cancelling;
                 true
             } else {
@@ -68,7 +81,7 @@ impl Control {
     pub(crate) fn cancel(&self) {
         let cancel = {
             let mut state = self.lifecycle.lock().unwrap();
-            if state.phase == Phase::Active {
+            if matches!(state.phase, Phase::Starting | Phase::Active) {
                 state.phase = Phase::Cancelling;
                 true
             } else {
@@ -78,9 +91,5 @@ impl Control {
         if cancel {
             self.cancellation.cancel();
         }
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        self.lifecycle.lock().unwrap().phase == Phase::Active
     }
 }

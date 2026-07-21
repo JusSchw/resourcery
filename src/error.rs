@@ -7,6 +7,8 @@ pub enum AcquireError {
     Occupied,
     /// The containing resource domain has begun shutdown.
     ShuttingDown,
+    /// Resource construction panicked before the generation was published.
+    ConstructionPanicked,
 }
 
 impl fmt::Display for AcquireError {
@@ -14,6 +16,7 @@ impl fmt::Display for AcquireError {
         match self {
             Self::Occupied => f.write_str("the canonical resource is already live"),
             Self::ShuttingDown => f.write_str("the resource domain is shutting down"),
+            Self::ConstructionPanicked => f.write_str("resource construction panicked"),
         }
     }
 }
@@ -27,6 +30,10 @@ pub enum RunError<E> {
     Acquire(AcquireError),
     /// The root task returned its declared resource error.
     Resource(Arc<E>),
+    /// The root resource task panicked.
+    Panicked(Arc<str>),
+    /// The root resource task was forcibly terminated by its executor.
+    Aborted,
 }
 
 impl<E: fmt::Display> fmt::Display for RunError<E> {
@@ -34,6 +41,8 @@ impl<E: fmt::Display> fmt::Display for RunError<E> {
         match self {
             Self::Acquire(error) => error.fmt(f),
             Self::Resource(error) => error.fmt(f),
+            Self::Panicked(message) => write!(f, "root resource panicked: {message}"),
+            Self::Aborted => f.write_str("root resource was aborted"),
         }
     }
 }

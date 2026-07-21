@@ -14,13 +14,16 @@ order follow naturally from ownership rather than a separate lifecycle graph.
 
 - `Resource` declares the input, error type, placement, interface, and task.
 - `ResourceSpec` joins a public interface to the task implementing it.
-- `ResourceRef` provides typed interface access and keeps one generation live.
+- `ResourceRef` is an owned, typed lease that keeps one generation live.
+- `ResourceCompletion` observes one terminal outcome without keeping it live.
 - `ResourceContext` lets a task acquire resources and observe cancellation.
 - `ResourceRuntime` owns an isolated domain and runs its root resource.
 - `Unique`, `Singleton`, and `Keyed` define how requests map to generations.
 
-The registry stores weak references. It can discover and deduplicate canonical
-resources, but it never keeps them alive.
+The registry stores weak references in per-identity construction slots. It can
+discover and deduplicate canonical resources, but it never keeps them alive.
+`ResourceRef` and `ResourceContext` are ordinary movable, shareable runtime
+handles; they deliberately have no phantom lexical lifetime.
 
 ## Defining and running resources
 
@@ -140,6 +143,10 @@ attached to the generation they originally acquired.
 | `get_or_spawn(input)` | Creates | Atomically retrieves or creates |
 | `all()` | Empty | Returns all active generations of the type |
 
+`status(key)` provides a non-blocking distinction between `Absent`, `Starting`,
+and `Active`. `get_or_spawn` waits behind the per-identity starting slot, so all
+concurrent callers receive the one generation that wins construction.
+
 Every returned strong reference counts as a lease. In particular, retaining the
 vector returned by `all` keeps every listed resource live.
 
@@ -150,11 +157,20 @@ Cancellation begins when the last `ResourceRef` is dropped or when
 on or await `ResourceContext::cancelled` and then perform bounded cleanup.
 Cancellation is cooperative: the framework does not forcibly abort a task.
 
-`ResourceRef::finished` waits for the task result. Errors are returned in an
-`Arc`, allowing multiple references to observe the same non-`Clone` error.
-Waiting through a strong reference itself keeps that generation alive, so a
-task that only exits after cancellation should not be awaited before its final
-lease is released.
+Create a non-owning observer with `ResourceRef::completion`. It is clonable,
+does not count as a lease, and remains usable after the interface is gone:
+
+```rust
+let completion = resource.completion();
+drop(resource);
+let outcome = completion.wait().await;
+```
+
+Every observer receives the same `ResourceOutcome`: `Completed`, `Failed`,
+`Panicked`, or `Aborted`. Declared errors and panic messages are shared in an
+`Arc`, so the resource error need not implement `Clone`. `ResourceRef::finished`
+is a convenience that waits while retaining that reference and is unsuitable
+for a task that exits only after its final lease is released.
 
 ## Dependencies and cycles
 
@@ -180,7 +196,9 @@ Each `ResourceRuntime` owns an independent registry, identity space, and
 cancellation domain. Canonical resources are shared only inside one runtime.
 Create separate runtimes when tests, tenants, or subsystems require isolation.
 
-`run` creates the root with its declared placement, waits for its task outcome,
-and returns either an acquisition failure or the root resource error. Calling
-`shutdown` requests cancellation for every tracked generation and prevents new
-acquisitions.
+`run` creates the root with its declared placement and maps its terminal outcome
+to `RunError`. `cancel` atomically closes acquisition and requests cooperative
+cancellation without waiting. `shutdown().await` additionally waits for all
+managed tasks to finish. `terminate().await` aborts tasks that cannot cooperate
+and reports `Aborted` to their completion observers. These operations are
+idempotent; once shutdown starts, the runtime cannot be restarted.

@@ -3,7 +3,7 @@ use std::{convert::Infallible, future::Future, pin::Pin};
 use crate::{Placement, ResourceContext};
 
 pub(crate) type BoxTask<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'static>>;
-pub(crate) type TaskFactory<E> = Box<dyn FnOnce(ResourceContext<'static>) -> BoxTask<E> + Send>;
+pub(crate) type TaskFactory<E> = Box<dyn FnOnce(ResourceContext) -> BoxTask<E> + Send>;
 
 /// A typed interface backed by a managed asynchronous task.
 pub trait Resource: Send + Sync + Sized + 'static {
@@ -35,7 +35,7 @@ impl<R, E> ResourceSpec<R, E> {
     /// resource dependencies it needs to retain.
     pub fn new<F, Fut>(interface: R, task: F) -> Self
     where
-        F: FnOnce(ResourceContext<'static>) -> Fut + Send + 'static,
+        F: FnOnce(ResourceContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
     {
         Self {
