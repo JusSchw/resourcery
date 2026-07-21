@@ -20,8 +20,9 @@ order follow naturally from ownership rather than a separate lifecycle graph.
 - `ResourceRuntime` owns an isolated domain and runs its root resource.
 - `Unique`, `Singleton`, and `Keyed` define how requests map to generations.
 
-The registry stores weak references in per-identity construction slots. It can
-discover and deduplicate canonical resources, but it never keeps them alive.
+The registry stores weak references in per-identity construction slots and a
+weak live-generation index. It can discover every placement and deduplicate
+canonical resources, but it never keeps them alive.
 `ResourceRef` and `ResourceContext` are ordinary movable, shareable runtime
 handles; they deliberately have no phantom lexical lifetime.
 
@@ -117,8 +118,9 @@ Larger applications commonly define their own root error type and implement
 ## Placement and identity
 
 `Unique` creates a new generation on every `spawn` call. It is suitable for
-jobs, sessions, and operations that must not be reused. Unique resources do not
-participate in `get` or `all` discovery.
+jobs, sessions, and operations that must not be reused. Unique resources have
+no canonical key, so `get`, `status`, and `get_or_spawn` are rejected by their
+type bounds, but their live generations are included by `all`.
 
 `Singleton` provides at most one active generation of a resource type in a
 domain. Its key is `()`.
@@ -139,16 +141,21 @@ attached to the generation they originally acquired.
 | Operation | Unique placement | Canonical placement |
 | --- | --- | --- |
 | `spawn(input)` | Always creates | Creates or returns `Occupied` |
-| `get(key)` | Always absent | Retrieves an active generation only |
-| `get_or_spawn(input)` | Creates | Atomically retrieves or creates |
-| `all()` | Empty | Returns all active generations of the type |
+| `get(key)` | Not available | Retrieves an active generation only |
+| `get_or_spawn(input)` | Not available | Atomically retrieves or creates |
+| `all()` | Returns all active generations | Returns all active generations |
 
-`status(key)` provides a non-blocking distinction between `Absent`, `Starting`,
-and `Active`. `get_or_spawn` waits behind the per-identity starting slot, so all
-concurrent callers receive the one generation that wins construction.
+`status(key)` distinguishes the semantic states `Absent`, `Starting`, and
+`Active`. It may briefly block while the slot state itself is updated, but
+ordinary construction runs outside that lock, and mutex contention is never
+reported as `Starting`. `get_or_spawn` waits behind an explicit per-identity
+starting state, so all concurrent callers receive the one established generation.
 
-Every returned strong reference counts as a lease. In particular, retaining the
-vector returned by `all` keeps every listed resource live.
+Every returned strong reference counts as a lease. Existing strong references
+can always be cloned, including during cancellation and after task completion.
+Weak references and discovery can create a lease only while both the generation
+and runtime are active. Retaining the vector returned by `all` keeps every
+listed resource live.
 
 ## Cancellation and completion
 
@@ -160,7 +167,7 @@ Cancellation is cooperative: the framework does not forcibly abort a task.
 Create a non-owning observer with `ResourceRef::completion`. It is clonable,
 does not count as a lease, and remains usable after the interface is gone:
 
-```rust
+```rust,ignore
 let completion = resource.completion();
 drop(resource);
 let outcome = completion.wait().await;
@@ -202,3 +209,8 @@ cancellation without waiting. `shutdown().await` additionally waits for all
 managed tasks to finish. `terminate().await` aborts tasks that cannot cooperate
 and reports `Aborted` to their completion observers. These operations are
 idempotent; once shutdown starts, the runtime cannot be restarted.
+
+Dropping a `ResourceRuntime` value releases only that handle. It does not abort
+or cancel managed resources. Managed tasks and their contexts retain the domain
+until they finish, so they never detach from supervision. Applications requiring
+deterministic cleanup must call `shutdown().await` or `terminate().await`.

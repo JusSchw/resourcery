@@ -3,6 +3,11 @@ use std::sync::Arc;
 use crate::{Resource, ResourceContext, ResourceOutcome, RunError, domain::Domain};
 
 /// Owns and executes one isolated resource domain.
+///
+/// Dropping this handle only releases the handle; it does not implicitly cancel
+/// or detach managed tasks. Use [`Self::shutdown`] or [`Self::terminate`] when
+/// deterministic cleanup is required.
+#[derive(Clone)]
 pub struct ResourceRuntime {
     domain: Arc<Domain>,
 }

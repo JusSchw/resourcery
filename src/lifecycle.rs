@@ -51,10 +51,7 @@ impl Control {
 
     pub(crate) fn clone_lease(&self) {
         let mut state = self.lifecycle.lock().unwrap();
-        assert!(
-            state.leases > 0 && state.phase == Phase::Active,
-            "new leases may only be created for an active resource"
-        );
+        debug_assert!(state.leases > 0, "a live ResourceRef owns a lease");
         state.leases += 1;
     }
 
@@ -91,5 +88,10 @@ impl Control {
         if cancel {
             self.cancellation.cancel();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn leases(&self) -> usize {
+        self.lifecycle.lock().unwrap().leases
     }
 }

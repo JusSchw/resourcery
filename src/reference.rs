@@ -5,7 +5,7 @@ use std::{
 
 use tokio::sync::watch;
 
-use crate::{Resource, lifecycle::Control};
+use crate::{Resource, domain::Domain, lifecycle::Control};
 
 /// The single terminal outcome of a managed resource generation.
 #[derive(Debug)]
@@ -35,14 +35,14 @@ pub(crate) struct Entry<R: Resource> {
     pub(crate) interface: R,
     pub(crate) control: Arc<Control>,
     pub(crate) finished: watch::Receiver<Option<ResourceOutcome<R::Error>>>,
+    pub(crate) domain: Weak<Domain>,
 }
 
 /// A movable, shareable strong lease on one resource generation.
 ///
 /// This is an ordinary runtime-domain handle, not a lexically scoped borrow.
-/// Cloning an active reference creates another lease. Once its task has reached
-/// a terminal outcome the remaining interface may still be read, but it cannot
-/// be cloned into a new lease. Dropping the final lease starts cancellation
+/// Cloning an existing reference creates another lease in every lifecycle
+/// state. Dropping the final lease starts cancellation
 /// exactly once. Runtime supervision and completion observers do not contain a
 /// `ResourceRef` and therefore do not count as leases.
 pub struct ResourceRef<R: Resource> {
@@ -79,6 +79,7 @@ impl<R: Resource> ResourceRef<R> {
     pub fn downgrade(&self) -> WeakResourceRef<R> {
         WeakResourceRef {
             entry: Arc::downgrade(&self.entry),
+            domain: self.entry.domain.clone(),
         }
     }
 
@@ -128,12 +129,14 @@ impl<E> ResourceCompletion<E> {
 /// A non-owning, optionally upgradeable reference.
 pub struct WeakResourceRef<R: Resource> {
     entry: Weak<Entry<R>>,
+    domain: Weak<Domain>,
 }
 
 impl<R: Resource> Clone for WeakResourceRef<R> {
     fn clone(&self) -> Self {
         Self {
             entry: self.entry.clone(),
+            domain: self.domain.clone(),
         }
     }
 }
@@ -145,6 +148,11 @@ impl<R: Resource> WeakResourceRef<R> {
     /// already finished.
     pub fn upgrade(&self) -> Option<ResourceRef<R>> {
         let entry = self.entry.upgrade()?;
-        entry.control.acquire().then_some(ResourceRef { entry })
+        let domain = self.domain.upgrade()?;
+        if domain.try_acquire(&entry) {
+            Some(ResourceRef { entry })
+        } else {
+            None
+        }
     }
 }

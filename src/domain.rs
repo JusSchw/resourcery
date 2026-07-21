@@ -14,17 +14,30 @@ type RegistryEntries<R> = HashMap<ResourceKey<R>, Arc<RegistrySlot<R>>>;
 
 pub(crate) struct Registry<R: Resource> {
     pub(crate) entries: Mutex<RegistryEntries<R>>,
+    pub(crate) live: Mutex<HashMap<u64, std::sync::Weak<Entry<R>>>>,
 }
 
 pub(crate) struct RegistrySlot<R: Resource> {
-    pub(crate) entry: Mutex<std::sync::Weak<Entry<R>>>,
-    pub(crate) generation: std::sync::atomic::AtomicU64,
+    pub(crate) state: Mutex<RegistrySlotState<R>>,
+    pub(crate) changed: std::sync::Condvar,
+}
+
+pub(crate) enum RegistrySlotState<R: Resource> {
+    Vacant,
+    Starting {
+        generation: u64,
+    },
+    Active {
+        generation: u64,
+        entry: std::sync::Weak<Entry<R>>,
+    },
 }
 
 impl<R: Resource> Default for Registry<R> {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -52,6 +65,23 @@ pub(crate) struct Domain {
     supervisor: Mutex<Supervisor>,
     quiescent: Notify,
     pub(crate) shutdown: CancellationToken,
+}
+
+pub(crate) struct TaskFinalizer {
+    domain: Arc<Domain>,
+    task_id: u64,
+}
+
+impl TaskFinalizer {
+    pub(crate) fn new(domain: Arc<Domain>, task_id: u64) -> Self {
+        Self { domain, task_id }
+    }
+}
+
+impl Drop for TaskFinalizer {
+    fn drop(&mut self) {
+        self.domain.task_finished(self.task_id);
+    }
 }
 
 impl Domain {
@@ -110,6 +140,16 @@ impl Domain {
         }
     }
 
+    /// Acquires a lease on the running side of the shutdown boundary.
+    pub(crate) fn try_acquire<R: Resource>(&self, entry: &Arc<Entry<R>>) -> bool {
+        let supervisor = self.supervisor.lock().unwrap();
+        supervisor.phase == DomainPhase::Running && entry.control.acquire()
+    }
+
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.supervisor.lock().unwrap().phase == DomainPhase::Running
+    }
+
     pub(crate) fn cancel(&self) {
         let controls = {
             let mut supervisor = self.supervisor.lock().unwrap();
@@ -147,10 +187,6 @@ impl Domain {
             abort.abort();
         }
         self.shutdown().await;
-    }
-
-    pub(crate) fn is_running(&self) -> bool {
-        self.supervisor.lock().unwrap().phase == DomainPhase::Running
     }
 
     pub(crate) async fn shutdown(&self) {

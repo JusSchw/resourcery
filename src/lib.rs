@@ -12,7 +12,7 @@ mod runtime;
 
 pub use context::{ResourceContext, ResourceStatus};
 pub use error::{AcquireError, RunError};
-pub use placement::{Keyed, Keyer, Placement, Singleton, Unique};
+pub use placement::{CanonicalPlacement, Keyed, Keyer, Placement, Singleton, Unique};
 pub use reference::{ResourceCompletion, ResourceOutcome, ResourceRef, WeakResourceRef};
 pub use resource::{Never, Resource, ResourceSpec};
 pub use runtime::ResourceRuntime;
