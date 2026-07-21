@@ -7,16 +7,11 @@ use tokio::sync::watch;
 
 use crate::{Resource, domain::Domain, lifecycle::Control};
 
-/// The single terminal outcome of a managed resource generation.
 #[derive(Debug)]
 pub enum ResourceOutcome<E> {
-    /// The resource task returned successfully.
     Completed,
-    /// The resource task returned its declared error.
     Failed(Arc<E>),
-    /// The resource task panicked. The string is the panic payload when known.
     Panicked(Arc<str>),
-    /// The executor terminated the task before it produced a result.
     Aborted,
 }
 
@@ -38,13 +33,6 @@ pub(crate) struct Entry<R: Resource> {
     pub(crate) domain: Weak<Domain>,
 }
 
-/// A movable, shareable strong lease on one resource generation.
-///
-/// This is an ordinary runtime-domain handle, not a lexically scoped borrow.
-/// Cloning an existing reference creates another lease in every lifecycle
-/// state. Dropping the final lease starts cancellation
-/// exactly once. Runtime supervision and completion observers do not contain a
-/// `ResourceRef` and therefore do not count as leases.
 pub struct ResourceRef<R: Resource> {
     pub(crate) entry: Arc<Entry<R>>,
 }
@@ -72,10 +60,6 @@ impl<R: Resource> Deref for ResourceRef<R> {
 }
 
 impl<R: Resource> ResourceRef<R> {
-    /// Creates a non-owning reference to this generation.
-    ///
-    /// The weak reference does not delay cancellation. Its upgrade fails once
-    /// the generation stops accepting new leases.
     pub fn downgrade(&self) -> WeakResourceRef<R> {
         WeakResourceRef {
             entry: Arc::downgrade(&self.entry),
@@ -83,23 +67,17 @@ impl<R: Resource> ResourceRef<R> {
         }
     }
 
-    /// Creates a non-owning, clonable terminal-outcome observer.
     pub fn completion(&self) -> ResourceCompletion<R::Error> {
         ResourceCompletion {
             receiver: self.entry.finished.clone(),
         }
     }
 
-    /// Waits for this generation's terminal outcome while retaining this lease.
     pub async fn finished(&self) -> ResourceOutcome<R::Error> {
         self.completion().wait().await
     }
 }
 
-/// A non-owning observer for one generation's terminal outcome.
-///
-/// It remains usable after every strong lease and the public interface have
-/// been released. Clones all observe the same immutable outcome.
 pub struct ResourceCompletion<E> {
     receiver: watch::Receiver<Option<ResourceOutcome<E>>>,
 }
@@ -113,7 +91,6 @@ impl<E> Clone for ResourceCompletion<E> {
 }
 
 impl<E> ResourceCompletion<E> {
-    /// Waits until the managed task reaches its one terminal state.
     pub async fn wait(mut self) -> ResourceOutcome<E> {
         loop {
             if let Some(result) = self.receiver.borrow().clone() {
@@ -126,7 +103,6 @@ impl<E> ResourceCompletion<E> {
     }
 }
 
-/// A non-owning, optionally upgradeable reference.
 pub struct WeakResourceRef<R: Resource> {
     entry: Weak<Entry<R>>,
     domain: Weak<Domain>,
@@ -142,10 +118,6 @@ impl<R: Resource> Clone for WeakResourceRef<R> {
 }
 
 impl<R: Resource> WeakResourceRef<R> {
-    /// Attempts to acquire a strong lease on the referenced generation.
-    ///
-    /// Returns `None` if the generation was reclaimed, is cancelling, or has
-    /// already finished.
     pub fn upgrade(&self) -> Option<ResourceRef<R>> {
         let entry = self.entry.upgrade()?;
         let domain = self.domain.upgrade()?;

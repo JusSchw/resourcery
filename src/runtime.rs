@@ -2,11 +2,6 @@ use std::sync::Arc;
 
 use crate::{Resource, ResourceContext, ResourceOutcome, RunError, domain::Domain};
 
-/// Owns and executes one isolated resource domain.
-///
-/// Dropping this handle only releases the handle; it does not implicitly cancel
-/// or detach managed tasks. Use [`Self::shutdown`] or [`Self::terminate`] when
-/// deterministic cleanup is required.
 #[derive(Clone)]
 pub struct ResourceRuntime {
     domain: Arc<Domain>,
@@ -19,22 +14,12 @@ impl Default for ResourceRuntime {
 }
 
 impl ResourceRuntime {
-    /// Creates a new, isolated resource domain.
-    ///
-    /// The runtime uses the currently active Tokio executor when resources are
-    /// spawned. Constructing it does not start any tasks.
     pub fn new() -> Self {
         Self {
             domain: Arc::new(Domain::new()),
         }
     }
 
-    /// Creates a root resource and waits for its managed task to finish.
-    ///
-    /// The runtime retains the root reference for the duration of this call.
-    /// Dependencies retained by the root are released when its task returns.
-    /// Separate calls use the same domain and therefore share canonical
-    /// resources unless shutdown has begun.
     pub async fn run<R: Resource>(&self, input: R::Input) -> Result<(), RunError<R::Error>> {
         let cx =
             ResourceContext::for_resource(self.domain.clone(), self.domain.shutdown.child_token());
@@ -47,21 +32,14 @@ impl ResourceRuntime {
         }
     }
 
-    /// Requests cooperative cancellation of every tracked generation.
-    ///
-    /// Shutdown is permanent for this runtime: subsequent acquisitions fail or
-    /// return no resource. This method does not wait for tasks to finish.
     pub fn cancel(&self) {
         self.domain.cancel();
     }
 
-    /// Requests cancellation and waits until every managed task has terminated.
     pub async fn shutdown(&self) {
         self.domain.shutdown().await;
     }
 
-    /// Begins shutdown, forcibly aborts all remaining managed tasks, and waits
-    /// until their `Aborted` terminal outcomes have been published.
     pub async fn terminate(&self) {
         self.domain.terminate().await;
     }

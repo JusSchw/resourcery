@@ -13,24 +13,15 @@ use crate::{
     reference::Entry,
 };
 
-/// Capabilities made available to a managed resource task.
-///
-/// Contexts and references are ordinary owned domain handles. They have no
-/// cosmetic lifetime parameter: any restrictions on retaining them are the
-/// normal `Send`, `Sync`, and `'static` restrictions enforced by Rust.
 #[derive(Clone)]
 pub struct ResourceContext {
     domain: Arc<Domain>,
     cancellation: CancellationToken,
 }
 
-/// Observable acquisition state for one canonical identity.
 pub enum ResourceStatus<R: Resource> {
-    /// No active or establishing generation has this identity.
     Absent,
-    /// A caller is currently constructing this identity.
     Starting,
-    /// The canonical generation is active; this variant contains a new lease.
     Active(ResourceRef<R>),
 }
 
@@ -42,7 +33,6 @@ impl ResourceContext {
         }
     }
 
-    /// Waits until this generation or its domain is cancelled.
     pub async fn cancelled(&self) {
         tokio::select! {
             _ = self.cancellation.cancelled() => {},
@@ -50,7 +40,6 @@ impl ResourceContext {
         }
     }
 
-    /// Executes bounded synchronous work on Tokio's blocking pool.
     pub async fn compute<F, T>(&self, work: F) -> Result<T, tokio::task::JoinError>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -59,7 +48,6 @@ impl ResourceContext {
         tokio::task::spawn_blocking(work).await
     }
 
-    /// Creates a generation, failing if a canonical identity is occupied.
     pub fn spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError> {
         if R::Placement::CANONICAL {
             self.acquire_canonical::<R>(input, true)
@@ -68,7 +56,6 @@ impl ResourceContext {
         }
     }
 
-    /// Retrieves an active canonical generation without creating it.
     pub fn get<R: Resource>(
         &self,
         key: &<R::Placement as Placement<R>>::Key,
@@ -90,7 +77,6 @@ impl ResourceContext {
         }
     }
 
-    /// Inspects a canonical identity without waiting for ongoing construction.
     pub fn status<R: Resource>(
         &self,
         key: &<R::Placement as Placement<R>>::Key,
@@ -115,7 +101,6 @@ impl ResourceContext {
         }
     }
 
-    /// Retrieves an active canonical generation or atomically creates it.
     pub fn get_or_spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError>
     where
         R::Placement: CanonicalPlacement<R>,
@@ -123,7 +108,6 @@ impl ResourceContext {
         self.acquire_canonical::<R>(input, false)
     }
 
-    /// Returns leases for all currently active generations of `R`.
     pub fn all<R: Resource>(&self) -> Vec<ResourceRef<R>> {
         let registry = self.domain.registry::<R>();
         let entries = registry

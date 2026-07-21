@@ -1,13 +1,9 @@
 use std::{fmt, sync::Arc};
 
-/// An error encountered while acquiring a resource generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireError {
-    /// Create-only spawning found an active canonical generation.
     Occupied,
-    /// The containing resource domain has begun shutdown.
     ShuttingDown,
-    /// Resource construction panicked before the generation was published.
     ConstructionPanicked,
 }
 
@@ -23,16 +19,11 @@ impl fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// Failure to acquire or execute the root resource.
 #[derive(Debug)]
 pub enum RunError<E> {
-    /// The runtime could not acquire the root resource.
     Acquire(AcquireError),
-    /// The root task returned its declared resource error.
     Resource(Arc<E>),
-    /// The root resource task panicked.
     Panicked(Arc<str>),
-    /// The root resource task was forcibly terminated by its executor.
     Aborted,
 }
 

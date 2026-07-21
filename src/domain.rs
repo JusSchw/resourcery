@@ -108,7 +108,6 @@ impl Domain {
             .clone()
     }
 
-    /// Atomically admits and activates a task on the running side of shutdown.
     pub(crate) fn register(
         &self,
         control: Arc<Control>,
@@ -140,7 +139,6 @@ impl Domain {
         }
     }
 
-    /// Acquires a lease on the running side of the shutdown boundary.
     pub(crate) fn try_acquire<R: Resource>(&self, entry: &Arc<Entry<R>>) -> bool {
         let supervisor = self.supervisor.lock().unwrap();
         supervisor.phase == DomainPhase::Running && entry.control.acquire()
