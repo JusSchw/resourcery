@@ -13,15 +13,24 @@ use crate::{
     reference::Entry,
 };
 
+/// An owned capability passed to a managed resource task.
+///
+/// A context provides access to the shared resource domain, the current
+/// generation's cancellation signal, and blocking computation. Cloning a
+/// context does not create a resource lease.
 #[derive(Clone)]
 pub struct ResourceContext {
     domain: Arc<Domain>,
     cancellation: CancellationToken,
 }
 
+/// The current registry state of a canonical identity.
 pub enum ResourceStatus<R: Resource> {
+    /// No active or under-construction generation is registered.
     Absent,
+    /// A caller is currently constructing the generation.
     Starting,
+    /// The active generation, returned as a newly acquired strong lease.
     Active(ResourceRef<R>),
 }
 
@@ -33,6 +42,10 @@ impl ResourceContext {
         }
     }
 
+    /// Waits until this generation or its containing domain is cancelled.
+    ///
+    /// Cancellation is cooperative: after this future resolves, the task should
+    /// finish pending work as appropriate, release owned values, and return.
     pub async fn cancelled(&self) {
         tokio::select! {
             _ = self.cancellation.cancelled() => {},
@@ -40,6 +53,11 @@ impl ResourceContext {
         }
     }
 
+    /// Runs synchronous work on Tokio's blocking thread pool.
+    ///
+    /// Computations have no resource identity and do not enter the dependency
+    /// graph. Dropping or cancelling the awaiting task does not stop blocking
+    /// work that has already started.
     pub async fn compute<F, T>(&self, work: F) -> Result<T, tokio::task::JoinError>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -48,6 +66,11 @@ impl ResourceContext {
         tokio::task::spawn_blocking(work).await
     }
 
+    /// Creates a new resource generation.
+    ///
+    /// For [`Unique`](crate::Unique), every call creates an independent
+    /// generation. For canonical placements, this is create-only and returns
+    /// [`AcquireError::Occupied`] if that identity is already active.
     pub fn spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError> {
         if R::Placement::CANONICAL {
             self.acquire_canonical::<R>(input, true)
@@ -56,6 +79,10 @@ impl ResourceContext {
         }
     }
 
+    /// Retrieves the active generation for a canonical key without creating it.
+    ///
+    /// Returns `None` while the identity is absent, still starting, cancelling,
+    /// finished, or when the domain is shutting down.
     pub fn get<R: Resource>(
         &self,
         key: &<R::Placement as Placement<R>>::Key,
@@ -77,6 +104,10 @@ impl ResourceContext {
         }
     }
 
+    /// Inspects the registry state for a canonical key.
+    ///
+    /// An [`Active`](ResourceStatus::Active) result contains a strong lease;
+    /// retaining it keeps that generation live.
     pub fn status<R: Resource>(
         &self,
         key: &<R::Placement as Placement<R>>::Key,
@@ -101,6 +132,12 @@ impl ResourceContext {
         }
     }
 
+    /// Retrieves the active canonical generation or creates one when absent.
+    ///
+    /// Concurrent calls for the same identity converge on one generation.
+    /// Input that is not represented in the placement key is used only by the
+    /// caller that establishes a new generation; acquisition never implicitly
+    /// reconfigures an existing one.
     pub fn get_or_spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError>
     where
         R::Placement: CanonicalPlacement<R>,
@@ -108,6 +145,11 @@ impl ResourceContext {
         self.acquire_canonical::<R>(input, false)
     }
 
+    /// Acquires every currently active generation of resource type `R`.
+    ///
+    /// This includes unique generations. The returned references are strong
+    /// leases; the registry itself does not keep generations alive. Ordering is
+    /// unspecified, and generations racing with this snapshot may be omitted.
     pub fn all<R: Resource>(&self) -> Vec<ResourceRef<R>> {
         let registry = self.domain.registry::<R>();
         let entries = registry

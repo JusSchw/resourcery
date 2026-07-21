@@ -1,9 +1,13 @@
 use std::{fmt, sync::Arc};
 
+/// Failure to acquire or establish a resource generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireError {
+    /// `spawn` was used for a canonical identity that is already active.
     Occupied,
+    /// The domain has begun shutdown and no longer accepts acquisitions.
     ShuttingDown,
+    /// [`Resource::build`](crate::Resource::build) panicked.
     ConstructionPanicked,
 }
 
@@ -19,11 +23,16 @@ impl fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
+/// Failure returned by [`ResourceRuntime::run`](crate::ResourceRuntime::run).
 #[derive(Debug)]
 pub enum RunError<E> {
+    /// The root generation could not be acquired.
     Acquire(AcquireError),
+    /// The root task returned its declared error.
     Resource(Arc<E>),
+    /// The root task panicked with this message.
     Panicked(Arc<str>),
+    /// The root task was forcibly aborted.
     Aborted,
 }
 
