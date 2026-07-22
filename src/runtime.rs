@@ -34,7 +34,7 @@ impl ResourceRuntime {
     pub async fn run<R: Resource>(&self, input: R::Input) -> Result<(), RunError<R::Error>> {
         let cx =
             ResourceContext::for_resource(self.domain.clone(), self.domain.shutdown.child_token());
-        let root = cx.spawn::<R>(input).map_err(RunError::Acquire)?;
+        let root = cx.spawn::<R>(input).await.map_err(RunError::Acquire)?;
         match root.finished().await {
             ResourceOutcome::Completed => Ok(()),
             ResourceOutcome::Failed(error) => Err(RunError::Resource(error)),

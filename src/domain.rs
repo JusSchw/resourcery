@@ -398,7 +398,7 @@ mod registry_tests {
         type Error = Infallible;
         type Placement = Singleton;
 
-        fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+        async fn build((): ()) -> ResourceSpec<Self, Self::Error> {
             ResourceSpec::new(Self, |_| async { Ok(()) })
         }
     }

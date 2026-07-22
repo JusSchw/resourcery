@@ -64,7 +64,7 @@ impl Resource for Configuration {
     type Error = Never;
     type Placement = Singleton;
 
-    fn build(environment: String) -> ResourceSpec<Self, Self::Error> {
+    async fn build(environment: String) -> ResourceSpec<Self, Self::Error> {
         ResourceSpec::new(Self { environment }, |cx| async move {
             cx.cancelled().await;
             Ok(())
@@ -79,7 +79,7 @@ impl Resource for Application {
     type Error = AcquireError;
     type Placement = Unique;
 
-    fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+    async fn build((): ()) -> ResourceSpec<Self, Self::Error> {
         ResourceSpec::new(Self, |cx| async move {
             let config = cx.get_or_spawn::<Configuration>("production".into()).await?;
             assert_eq!(config.environment, "production");
@@ -101,11 +101,11 @@ runtime.shutdown().await;
 # }
 ```
 
-`Resource::build` is synchronous: it publishes the interface and defines the
-future that will drive it. It must therefore be short and non-blocking; put
-ongoing or blocking work in the returned future or use `cx.compute`. A panic in
-`build` is an acquisition error; a panic while polling the task is a terminal
-resource outcome.
+`Resource::build` is asynchronous, so construction can await initialization
+without blocking a runtime worker. The interface is published only after build
+returns, and the managed task starts only after the generation is registered.
+A panic while creating or polling `build` is an acquisition error; a panic while
+polling the managed task is a terminal resource outcome.
 
 ## Placement and identity
 
@@ -138,7 +138,7 @@ impl Resource for Database {
     type Error = Never;
     type Placement = Keyed<ByName>;
 
-    fn build(input: Self::Input) -> ResourceSpec<Self, Self::Error> {
+    async fn build(input: Self::Input) -> ResourceSpec<Self, Self::Error> {
         let interface = Self { name: input.name };
         ResourceSpec::new(interface, |cx| async move {
             // `pool_size` would configure this newly created generation.
@@ -164,10 +164,10 @@ The method communicates whether reuse is acceptable:
 
 | Operation | Meaning | Creates? | Reuses? |
 |---|---|---:|---:|
-| `cx.spawn::<R>(input)` | Establish a new generation | yes | no |
+| `cx.spawn::<R>(input).await` | Establish a new generation | yes | no |
 | `cx.get::<R>(&key)` | Retrieve an active canonical generation | no | yes |
 | `cx.get_or_spawn::<R>(input).await` | Retrieve it or asynchronously wait to establish it | if absent | yes |
-| `cx.try_get_or_spawn::<R>(input)` | Retrieve or establish without waiting | if absent | yes |
+| `cx.try_get_or_spawn::<R>(input).await` | Retrieve or establish without waiting for another constructor | if absent | yes |
 | `cx.status::<R>(&key)` | Observe absent, starting, or active state | no | active lease |
 | `cx.all::<R>()` | Snapshot all active generations of a type | no | active leases |
 

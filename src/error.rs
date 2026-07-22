@@ -9,7 +9,7 @@ pub enum AcquireError {
     /// The domain has begun shutdown and no longer accepts acquisitions.
     #[error("the resource domain is shutting down")]
     ShuttingDown,
-    /// [`Resource::build`](crate::Resource::build) panicked.
+    /// [`Resource::build`](crate::Resource::build) panicked during construction.
     #[error("resource construction panicked")]
     ConstructionPanicked,
 }

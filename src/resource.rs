@@ -8,7 +8,7 @@ pub(crate) type TaskFactory<E> = Box<dyn FnOnce(ResourceContext) -> BoxTask<E> +
 /// A typed public interface backed by one managed asynchronous task.
 ///
 /// `build` is called once for each newly established generation. It constructs
-/// the interface synchronously and returns the task that drives it. For a
+/// the interface asynchronously and returns the task that drives it. For a
 /// canonical placement, the input's key selects an existing generation before
 /// `build` is called; creation-only input is therefore ignored when a generation
 /// is reused.
@@ -22,11 +22,11 @@ pub trait Resource: Send + Sync + Sized + 'static {
 
     /// Constructs the public interface and managed task for a new generation.
     ///
-    /// A panic from this method is reported as
+    /// A panic while creating or polling the returned future is reported as
     /// [`AcquireError::ConstructionPanicked`](crate::AcquireError::ConstructionPanicked).
     /// Panics from the returned task instead become
     /// [`ResourceOutcome::Panicked`](crate::ResourceOutcome::Panicked).
-    fn build(input: Self::Input) -> ResourceSpec<Self, Self::Error>;
+    fn build(input: Self::Input) -> impl Future<Output = ResourceSpec<Self, Self::Error>> + Send;
 }
 
 /// The two parts of a resource generation: its public interface and its task.

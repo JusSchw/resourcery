@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use futures_util::FutureExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +33,30 @@ pub enum ResourceStatus<R: Resource> {
     Starting,
     /// The active generation, returned as a newly acquired strong lease.
     Active(ResourceRef<R>),
+}
+
+struct CanonicalConstructionGuard<R: Resource> {
+    registry: Arc<Registry<R>>,
+    key: <R::Placement as Placement<R>>::Key,
+    slot: Arc<RegistrySlot<R>>,
+    generation: u64,
+    armed: bool,
+}
+
+impl<R: Resource> CanonicalConstructionGuard<R> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<R: Resource> Drop for CanonicalConstructionGuard<R> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .remove_if_same(&self.key, &self.slot, self.generation);
+            self.slot.changed.notify(usize::MAX);
+        }
+    }
 }
 
 impl ResourceContext {
@@ -68,11 +93,14 @@ impl ResourceContext {
     /// For [`Unique`](crate::Unique), every call creates an independent
     /// generation. For canonical placements, this is create-only and returns
     /// [`AcquireError::Occupied`] if that identity is starting or active.
-    pub fn spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError> {
+    pub async fn spawn<R: Resource>(
+        &self,
+        input: R::Input,
+    ) -> Result<ResourceRef<R>, AcquireError> {
         if R::Placement::CANONICAL {
-            self.spawn_canonical::<R>(input)
+            self.spawn_canonical::<R>(input).await
         } else {
-            self.create_and_start::<R>(input, None)
+            self.create_and_start::<R>(input, None).await
         }
     }
 
@@ -131,9 +159,8 @@ impl ResourceContext {
     /// Retrieves the active canonical generation or creates one when absent.
     ///
     /// Concurrent calls for the same identity converge on one generation.
-    /// Callers waiting for another constructor suspend without blocking a
-    /// runtime worker thread. [`Resource::build`] itself remains synchronous
-    /// and should be short and non-blocking.
+    /// Callers waiting for another constructor or awaiting [`Resource::build`]
+    /// suspend without blocking a runtime worker thread.
     /// Input that is not represented in the placement key is used only by the
     /// caller that establishes a new generation; acquisition never implicitly
     /// reconfigures an existing one.
@@ -156,14 +183,14 @@ impl ResourceContext {
     ///
     /// Returns [`AcquireError::Occupied`] when another caller is currently
     /// constructing the identity.
-    pub fn try_get_or_spawn<R: Resource>(
+    pub async fn try_get_or_spawn<R: Resource>(
         &self,
         input: R::Input,
     ) -> Result<ResourceRef<R>, AcquireError>
     where
         R::Placement: CanonicalPlacement<R>,
     {
-        self.try_acquire_canonical::<R>(input, false)
+        self.try_acquire_canonical::<R>(input, false).await
     }
 
     /// Acquires every currently active generation of resource type `R`.
@@ -216,16 +243,17 @@ impl ResourceContext {
             }
         };
         self.finish_canonical_creation(input, key, registry, slot, generation)
+            .await
     }
 
-    fn spawn_canonical<R: Resource>(
+    async fn spawn_canonical<R: Resource>(
         &self,
         input: R::Input,
     ) -> Result<ResourceRef<R>, AcquireError> {
-        self.try_acquire_canonical::<R>(input, true)
+        self.try_acquire_canonical::<R>(input, true).await
     }
 
-    fn try_acquire_canonical<R: Resource>(
+    async fn try_acquire_canonical<R: Resource>(
         &self,
         input: R::Input,
         create_only: bool,
@@ -242,9 +270,10 @@ impl ResourceContext {
             RegistryClaim::ShuttingDown => return Err(AcquireError::ShuttingDown),
         };
         self.finish_canonical_creation(input, key, registry, slot, generation)
+            .await
     }
 
-    fn finish_canonical_creation<R: Resource>(
+    async fn finish_canonical_creation<R: Resource>(
         &self,
         input: R::Input,
         key: <R::Placement as Placement<R>>::Key,
@@ -252,20 +281,27 @@ impl ResourceContext {
         slot: Arc<RegistrySlot<R>>,
         generation: u64,
     ) -> Result<ResourceRef<R>, AcquireError> {
+        let mut construction = CanonicalConstructionGuard {
+            registry: registry.clone(),
+            key: key.clone(),
+            slot: slot.clone(),
+            generation,
+            armed: true,
+        };
         let cleanup_registry = registry.clone();
         let cleanup_key = key.clone();
         let cleanup_slot = slot.clone();
-        let resource = self.create::<R>(
-            input,
-            Some(Box::new(move || {
-                cleanup_registry.remove_if_same(&cleanup_key, &cleanup_slot, generation);
-            })),
-        );
+        let resource = self
+            .create::<R>(
+                input,
+                Some(Box::new(move || {
+                    cleanup_registry.remove_if_same(&cleanup_key, &cleanup_slot, generation);
+                })),
+            )
+            .await;
         match resource {
             Ok((resource, start)) => {
                 if !self.domain.is_accepting() {
-                    registry.remove_if_same(&key, &slot, generation);
-                    slot.changed.notify(usize::MAX);
                     let _ = start.send(());
                     return Err(AcquireError::ShuttingDown);
                 }
@@ -275,29 +311,26 @@ impl ResourceContext {
                     entry: Arc::downgrade(&resource.entry),
                 };
                 drop(state);
+                construction.disarm();
                 slot.changed.notify(usize::MAX);
                 let _ = start.send(());
                 Ok(resource)
             }
-            Err(error) => {
-                registry.remove_if_same(&key, &slot, generation);
-                slot.changed.notify(usize::MAX);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
-    fn create_and_start<R: Resource>(
+    async fn create_and_start<R: Resource>(
         &self,
         input: R::Input,
         on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<ResourceRef<R>, AcquireError> {
-        let (resource, start) = self.create::<R>(input, on_finish)?;
+        let (resource, start) = self.create::<R>(input, on_finish).await?;
         let _ = start.send(());
         Ok(resource)
     }
 
-    fn create<R: Resource>(
+    async fn create<R: Resource>(
         &self,
         input: R::Input,
         on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -307,7 +340,11 @@ impl ResourceContext {
         }
         #[cfg(feature = "tracing")]
         let build_started = std::time::Instant::now();
-        let spec = catch_unwind(AssertUnwindSafe(|| R::build(input)))
+        let build = catch_unwind(AssertUnwindSafe(|| R::build(input)))
+            .map_err(|_| AcquireError::ConstructionPanicked)?;
+        let spec = AssertUnwindSafe(build)
+            .catch_unwind()
+            .await
             .map_err(|_| AcquireError::ConstructionPanicked)?;
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -399,7 +436,7 @@ mod tests {
         type Error = Infallible;
         type Placement = Keyed<ByKey>;
 
-        fn build(input: Self::Input) -> ResourceSpec<Self, Self::Error> {
+        async fn build(input: Self::Input) -> ResourceSpec<Self, Self::Error> {
             let generation = BUILDS.fetch_add(1, Ordering::SeqCst);
             ResourceSpec::new(Self(generation), move |cx| async move {
                 cx.cancelled().await;
@@ -414,7 +451,7 @@ mod tests {
         type Input = ();
         type Error = Infallible;
         type Placement = Singleton;
-        fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+        async fn build((): ()) -> ResourceSpec<Self, Self::Error> {
             ResourceSpec::new(Self, |_| async move { panic!("managed boom") })
         }
     }
@@ -424,7 +461,7 @@ mod tests {
         type Input = ();
         type Error = Infallible;
         type Placement = Unique;
-        fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+        async fn build((): ()) -> ResourceSpec<Self, Self::Error> {
             ResourceSpec::new(Self, |_| async move {
                 std::future::pending::<()>().await;
                 Ok(())
@@ -437,19 +474,19 @@ mod tests {
         type Input = ();
         type Error = Infallible;
         type Placement = Unique;
-        fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+        async fn build((): ()) -> ResourceSpec<Self, Self::Error> {
             ResourceSpec::new(Self, |_| async move { Ok(()) })
         }
     }
 
     struct StartingResource;
     impl Resource for StartingResource {
-        type Input = Arc<std::sync::Barrier>;
+        type Input = Arc<tokio::sync::Barrier>;
         type Error = Infallible;
         type Placement = Singleton;
-        fn build(barrier: Self::Input) -> ResourceSpec<Self, Self::Error> {
-            barrier.wait();
-            barrier.wait();
+        async fn build(barrier: Self::Input) -> ResourceSpec<Self, Self::Error> {
+            barrier.wait().await;
+            barrier.wait().await;
             ResourceSpec::new(Self, |cx| async move {
                 cx.cancelled().await;
                 Ok(())
@@ -462,7 +499,8 @@ mod tests {
         type Input = ();
         type Error = Infallible;
         type Placement = Singleton;
-        fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+        async fn build((): ()) -> ResourceSpec<Self, Self::Error> {
+            tokio::task::yield_now().await;
             panic!("construction boom")
         }
     }
@@ -499,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn panic_is_a_stable_terminal_outcome() {
         let (_, cx) = context();
-        let resource = cx.spawn::<PanicResource>(()).unwrap();
+        let resource = cx.spawn::<PanicResource>(()).await.unwrap();
         let one = resource.completion();
         let two = one.clone();
         assert!(
@@ -614,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn forced_termination_publishes_aborted_and_quiesces() {
         let (domain, cx) = context();
-        let resource = cx.spawn::<StuckResource>(()).unwrap();
+        let resource = cx.spawn::<StuckResource>(()).await.unwrap();
         let completion = resource.completion();
         domain.terminate().await;
         assert!(matches!(completion.wait().await, ResourceOutcome::Aborted));
@@ -624,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn strong_references_clone_after_completion_and_during_shutdown() {
         let (domain, cx) = context();
-        let finished = cx.spawn::<FastResource>(()).unwrap();
+        let finished = cx.spawn::<FastResource>(()).await.unwrap();
         assert!(matches!(
             finished.finished().await,
             ResourceOutcome::Completed
@@ -633,7 +671,7 @@ mod tests {
         drop(finished);
         drop(clone);
 
-        let cancelling = cx.spawn::<StuckResource>(()).unwrap();
+        let cancelling = cx.spawn::<StuckResource>(()).await.unwrap();
         assert_eq!(Arc::strong_count(&cancelling.entry), 1);
         domain.cancel();
         let clone = cancelling.clone();
@@ -647,8 +685,8 @@ mod tests {
     #[tokio::test]
     async fn all_includes_unique_generations_without_retaining_them() {
         let (domain, cx) = context();
-        let first = cx.spawn::<StuckResource>(()).unwrap();
-        let second = cx.spawn::<StuckResource>(()).unwrap();
+        let first = cx.spawn::<StuckResource>(()).await.unwrap();
+        let second = cx.spawn::<StuckResource>(()).await.unwrap();
         assert_eq!(cx.all::<StuckResource>().len(), 2);
         drop((first, second));
         domain.terminate().await;
@@ -658,20 +696,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_reports_explicit_starting_state() {
         let (_, cx) = context();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let spawning = {
             let cx = cx.clone();
             let barrier = barrier.clone();
-            tokio::task::spawn_blocking(move || {
-                cx.try_get_or_spawn::<StartingResource>(barrier).unwrap()
+            tokio::spawn(async move {
+                cx.try_get_or_spawn::<StartingResource>(barrier)
+                    .await
+                    .unwrap()
             })
         };
-        barrier.wait();
+        barrier.wait().await;
         assert!(matches!(
             cx.status::<StartingResource>(&()),
             ResourceStatus::Starting
         ));
-        barrier.wait();
+        barrier.wait().await;
         let resource = spawning.await.unwrap();
         assert!(matches!(
             cx.status::<StartingResource>(&()),
@@ -693,18 +733,56 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn cancelled_async_construction_restores_absent_slot() {
+        let (_, cx) = context();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let construction = {
+            let cx = cx.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move { cx.get_or_spawn::<StartingResource>(barrier).await })
+        };
+        barrier.wait().await;
+        assert!(matches!(
+            cx.status::<StartingResource>(&()),
+            ResourceStatus::Starting
+        ));
+
+        construction.abort();
+        assert!(matches!(construction.await, Err(error) if error.is_cancelled()));
+        assert!(matches!(
+            cx.status::<StartingResource>(&()),
+            ResourceStatus::Absent
+        ));
+
+        let replacement_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let replacement = {
+            let cx = cx.clone();
+            let barrier = replacement_barrier.clone();
+            tokio::spawn(async move { cx.get_or_spawn::<StartingResource>(barrier).await })
+        };
+        replacement_barrier.wait().await;
+        replacement_barrier.wait().await;
+        let resource = replacement.await.unwrap().unwrap();
+        assert!(matches!(
+            cx.status::<StartingResource>(&()),
+            ResourceStatus::Active(_)
+        ));
+        drop(resource);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canonical_construction_racing_shutdown_cannot_activate() {
         let (domain, cx) = context();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let spawning = {
             let cx = cx.clone();
             let barrier = barrier.clone();
-            tokio::task::spawn_blocking(move || cx.try_get_or_spawn::<StartingResource>(barrier))
+            tokio::spawn(async move { cx.try_get_or_spawn::<StartingResource>(barrier).await })
         };
-        barrier.wait();
+        barrier.wait().await;
         domain.cancel();
-        barrier.wait();
+        barrier.wait().await;
         assert!(matches!(
             spawning.await.unwrap(),
             Err(AcquireError::ShuttingDown)
@@ -719,15 +797,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn same_key_waiters_do_not_block_runtime_workers() {
         let (domain, cx) = context();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let owner = {
             let cx = cx.clone();
             let barrier = barrier.clone();
-            tokio::task::spawn_blocking(move || {
-                cx.try_get_or_spawn::<StartingResource>(barrier).unwrap()
+            tokio::spawn(async move {
+                cx.try_get_or_spawn::<StartingResource>(barrier)
+                    .await
+                    .unwrap()
             })
         };
-        barrier.wait();
+        barrier.wait().await;
 
         let mut waiters = Vec::new();
         for _ in 0..64 {
@@ -754,7 +834,7 @@ mod tests {
             .unwrap();
         assert_eq!(heartbeat.load(Ordering::SeqCst), 10);
 
-        barrier.wait();
+        barrier.wait().await;
         let resource = owner.await.unwrap();
         for waiter in waiters {
             let acquired = waiter.await.unwrap();
@@ -769,6 +849,7 @@ mod tests {
         let (domain, cx) = context();
         let resource = cx
             .create_and_start::<FastResource>((), Some(Box::new(|| panic!("cleanup boom"))))
+            .await
             .unwrap();
         assert!(matches!(
             resource.finished().await,
