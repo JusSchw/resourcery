@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AcquireError, CanonicalPlacement, Placement, Resource, ResourceOutcome, ResourceRef,
-    domain::{Domain, Registry, RegistrySlot, RegistrySlotState, TaskFinalizer},
+    domain::{Domain, Registry, RegistryClaim, RegistrySlot, RegistrySlotState, TaskFinalizer},
     lifecycle::Control,
     reference::Entry,
 };
@@ -118,7 +118,6 @@ impl ResourceContext {
         };
         let state = slot.state.lock();
         match &*state {
-            RegistrySlotState::Vacant => ResourceStatus::Absent,
             RegistrySlotState::Starting { .. } => ResourceStatus::Starting,
             RegistrySlotState::Active { entry, .. } => entry
                 .upgrade()
@@ -200,53 +199,22 @@ impl ResourceContext {
         }
         let key = R::Placement::placement_key(&input);
         let registry = self.domain.registry::<R>();
-        let (slot, mut owner) =
-            registry.slot_or_insert(key.clone(), || Arc::new(RegistrySlot::starting(1)));
-        let mut generation = 1;
-
-        while !owner {
-            let listener = slot.changed.listen();
-            let should_wait = {
-                let mut state = slot.state.lock();
-                match &*state {
-                    RegistrySlotState::Starting { .. } => true,
-                    RegistrySlotState::Vacant => {
-                        if !self.domain.is_accepting() {
-                            return Err(AcquireError::ShuttingDown);
-                        }
-                        generation = 1;
-                        *state = RegistrySlotState::Starting { generation };
-                        owner = true;
-                        false
-                    }
-                    RegistrySlotState::Active {
-                        generation: current,
-                        entry,
-                    } => {
-                        if let Some(entry) = entry.upgrade()
-                            && self.domain.try_acquire(&entry)
-                        {
-                            return Ok(ResourceRef { entry });
-                        }
-                        if !self.domain.is_accepting() {
-                            return Err(AcquireError::ShuttingDown);
-                        }
-                        generation = *current + 1;
-                        *state = RegistrySlotState::Starting { generation };
-                        owner = true;
-                        false
-                    }
+        let (slot, generation) = loop {
+            match registry.claim(&key, &self.domain, false) {
+                RegistryClaim::Active(entry) => return Ok(ResourceRef { entry }),
+                RegistryClaim::Owner { slot, generation } => break (slot, generation),
+                RegistryClaim::Wait(listener) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(
+                        resource = std::any::type_name::<R>(),
+                        "waiting for canonical construction"
+                    );
+                    listener.await;
                 }
-            };
-            if should_wait {
-                #[cfg(feature = "tracing")]
-                tracing::trace!(
-                    resource = std::any::type_name::<R>(),
-                    "waiting for canonical construction"
-                );
-                listener.await;
+                RegistryClaim::Occupied => unreachable!("reusable acquisition is not create-only"),
+                RegistryClaim::ShuttingDown => return Err(AcquireError::ShuttingDown),
             }
-        }
+        };
         self.finish_canonical_creation(input, key, registry, slot, generation)
     }
 
@@ -267,33 +235,11 @@ impl ResourceContext {
         }
         let key = R::Placement::placement_key(&input);
         let registry = self.domain.registry::<R>();
-        let (slot, owner) =
-            registry.slot_or_insert(key.clone(), || Arc::new(RegistrySlot::starting(1)));
-        let generation = if owner {
-            1
-        } else {
-            let mut state = slot.state.lock();
-            match &*state {
-                RegistrySlotState::Starting { .. } => return Err(AcquireError::Occupied),
-                RegistrySlotState::Active { generation, entry } => {
-                    if let Some(entry) = entry.upgrade()
-                        && self.domain.try_acquire(&entry)
-                    {
-                        return if create_only {
-                            Err(AcquireError::Occupied)
-                        } else {
-                            Ok(ResourceRef { entry })
-                        };
-                    }
-                    let next = *generation + 1;
-                    *state = RegistrySlotState::Starting { generation: next };
-                    next
-                }
-                RegistrySlotState::Vacant => {
-                    *state = RegistrySlotState::Starting { generation: 1 };
-                    1
-                }
-            }
+        let (slot, generation) = match registry.claim(&key, &self.domain, create_only) {
+            RegistryClaim::Active(entry) => return Ok(ResourceRef { entry }),
+            RegistryClaim::Owner { slot, generation } => (slot, generation),
+            RegistryClaim::Wait(_) | RegistryClaim::Occupied => return Err(AcquireError::Occupied),
+            RegistryClaim::ShuttingDown => return Err(AcquireError::ShuttingDown),
         };
         self.finish_canonical_creation(input, key, registry, slot, generation)
     }
@@ -318,7 +264,6 @@ impl ResourceContext {
         match resource {
             Ok((resource, start)) => {
                 if !self.domain.is_accepting() {
-                    *slot.state.lock() = RegistrySlotState::Vacant;
                     registry.remove_if_same(&key, &slot, generation);
                     slot.changed.notify(usize::MAX);
                     let _ = start.send(());
@@ -335,7 +280,6 @@ impl ResourceContext {
                 Ok(resource)
             }
             Err(error) => {
-                *slot.state.lock() = RegistrySlotState::Vacant;
                 registry.remove_if_same(&key, &slot, generation);
                 slot.changed.notify(usize::MAX);
                 Err(error)
