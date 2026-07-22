@@ -1,27 +1,18 @@
 use std::{fmt, sync::Arc};
 
 /// Failure to acquire or establish a resource generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AcquireError {
-    /// `spawn` was used for a canonical identity that is already active.
+    /// A non-waiting operation found a canonical identity starting or active.
+    #[error("the canonical resource is already live or starting")]
     Occupied,
     /// The domain has begun shutdown and no longer accepts acquisitions.
+    #[error("the resource domain is shutting down")]
     ShuttingDown,
     /// [`Resource::build`](crate::Resource::build) panicked.
+    #[error("resource construction panicked")]
     ConstructionPanicked,
 }
-
-impl fmt::Display for AcquireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Occupied => f.write_str("the canonical resource is already live"),
-            Self::ShuttingDown => f.write_str("the resource domain is shutting down"),
-            Self::ConstructionPanicked => f.write_str("resource construction panicked"),
-        }
-    }
-}
-
-impl std::error::Error for AcquireError {}
 
 /// Failure returned by [`ResourceRuntime::run`](crate::ResourceRuntime::run).
 #[derive(Debug)]
@@ -36,7 +27,7 @@ pub enum RunError<E> {
     Aborted,
 }
 
-impl<E: fmt::Display> fmt::Display for RunError<E> {
+impl<E: std::fmt::Display> std::fmt::Display for RunError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Acquire(error) => error.fmt(f),
@@ -47,4 +38,4 @@ impl<E: fmt::Display> fmt::Display for RunError<E> {
     }
 }
 
-impl<E: fmt::Debug + fmt::Display> std::error::Error for RunError<E> {}
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for RunError<E> {}

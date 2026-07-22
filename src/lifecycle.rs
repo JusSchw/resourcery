@@ -1,8 +1,9 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum Phase {
     Starting,
     Active,
@@ -10,88 +11,56 @@ pub(crate) enum Phase {
     Finished,
 }
 
-struct Lifecycle {
-    leases: usize,
-    phase: Phase,
-}
-
 pub(crate) struct Control {
-    lifecycle: Mutex<Lifecycle>,
+    phase: AtomicU8,
     pub(crate) cancellation: CancellationToken,
 }
 
 impl Control {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(cancellation: CancellationToken) -> Self {
         Self {
-            lifecycle: Mutex::new(Lifecycle {
-                leases: 1,
-                phase: Phase::Starting,
-            }),
-            cancellation: CancellationToken::new(),
+            phase: AtomicU8::new(Phase::Starting as u8),
+            cancellation,
         }
     }
 
     pub(crate) fn activate(&self) -> bool {
-        let mut state = self.lifecycle.lock().unwrap();
-        if state.phase != Phase::Starting {
-            return false;
-        }
-        state.phase = Phase::Active;
-        true
+        self.phase
+            .compare_exchange(
+                Phase::Starting as u8,
+                Phase::Active as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
-    pub(crate) fn acquire(&self) -> bool {
-        let mut state = self.lifecycle.lock().unwrap();
-        if state.phase != Phase::Active || state.leases == 0 {
-            return false;
-        }
-        state.leases += 1;
-        true
-    }
-
-    pub(crate) fn clone_lease(&self) {
-        let mut state = self.lifecycle.lock().unwrap();
-        debug_assert!(state.leases > 0, "a live ResourceRef owns a lease");
-        state.leases += 1;
-    }
-
-    pub(crate) fn release(&self) {
-        let cancel = {
-            let mut state = self.lifecycle.lock().unwrap();
-            state.leases -= 1;
-            if state.leases == 0 && matches!(state.phase, Phase::Starting | Phase::Active) {
-                state.phase = Phase::Cancelling;
-                true
-            } else {
-                false
-            }
-        };
-        if cancel {
-            self.cancellation.cancel();
-        }
+    pub(crate) fn is_active(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == Phase::Active as u8
     }
 
     pub(crate) fn finish(&self) {
-        self.lifecycle.lock().unwrap().phase = Phase::Finished;
+        self.phase.store(Phase::Finished as u8, Ordering::Release);
     }
 
     pub(crate) fn cancel(&self) {
-        let cancel = {
-            let mut state = self.lifecycle.lock().unwrap();
-            if matches!(state.phase, Phase::Starting | Phase::Active) {
-                state.phase = Phase::Cancelling;
-                true
-            } else {
-                false
+        let mut current = self.phase.load(Ordering::Acquire);
+        loop {
+            if current != Phase::Starting as u8 && current != Phase::Active as u8 {
+                return;
             }
-        };
-        if cancel {
-            self.cancellation.cancel();
+            match self.phase.compare_exchange_weak(
+                current,
+                Phase::Cancelling as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.cancellation.cancel();
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn leases(&self) -> usize {
-        self.lifecycle.lock().unwrap().leases
     }
 }

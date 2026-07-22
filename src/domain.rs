@@ -1,25 +1,105 @@
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
+use dashmap::DashMap;
+use event_listener::Event;
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{Placement, Resource, lifecycle::Control, reference::Entry};
 
 type ResourceKey<R> = <<R as Resource>::Placement as Placement<R>>::Key;
-type RegistryEntries<R> = HashMap<ResourceKey<R>, Arc<RegistrySlot<R>>>;
 
 pub(crate) struct Registry<R: Resource> {
-    pub(crate) entries: Mutex<RegistryEntries<R>>,
-    pub(crate) live: Mutex<HashMap<u64, std::sync::Weak<Entry<R>>>>,
+    entries: DashMap<ResourceKey<R>, Arc<RegistrySlot<R>>>,
+    live: DashMap<u64, Weak<Entry<R>>>,
+}
+
+impl<R: Resource> Registry<R> {
+    pub(crate) fn slot(&self, key: &ResourceKey<R>) -> Option<Arc<RegistrySlot<R>>> {
+        self.entries.get(key).map(|slot| Arc::clone(slot.value()))
+    }
+
+    pub(crate) fn slot_or_insert(
+        &self,
+        key: ResourceKey<R>,
+        slot: impl FnOnce() -> Arc<RegistrySlot<R>>,
+    ) -> (Arc<RegistrySlot<R>>, bool) {
+        use dashmap::mapref::entry::Entry;
+        match self.entries.entry(key) {
+            Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            Entry::Vacant(entry) => {
+                let slot = slot();
+                entry.insert(slot.clone());
+                (slot, true)
+            }
+        }
+    }
+
+    pub(crate) fn remove_if_same(
+        &self,
+        key: &ResourceKey<R>,
+        slot: &Arc<RegistrySlot<R>>,
+        generation: u64,
+    ) {
+        self.entries.remove_if(key, |_, present| {
+            Arc::ptr_eq(present, slot) && slot.has_generation(generation)
+        });
+    }
+
+    pub(crate) fn insert_live(&self, id: u64, entry: Weak<Entry<R>>) {
+        self.live.insert(id, entry);
+    }
+
+    pub(crate) fn remove_live(&self, id: u64) {
+        self.live.remove(&id);
+    }
+
+    pub(crate) fn live_snapshot(&self) -> Vec<Weak<Entry<R>>> {
+        self.live
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries_is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries_len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 pub(crate) struct RegistrySlot<R: Resource> {
     pub(crate) state: Mutex<RegistrySlotState<R>>,
-    pub(crate) changed: std::sync::Condvar,
+    pub(crate) changed: Event,
+}
+
+impl<R: Resource> RegistrySlot<R> {
+    pub(crate) fn starting(generation: u64) -> Self {
+        Self {
+            state: Mutex::new(RegistrySlotState::Starting { generation }),
+            changed: Event::new(),
+        }
+    }
+
+    fn has_generation(&self, expected: u64) -> bool {
+        match &*self.state.lock() {
+            RegistrySlotState::Vacant => true,
+            RegistrySlotState::Starting { generation }
+            | RegistrySlotState::Active { generation, .. } => *generation == expected,
+        }
+    }
 }
 
 pub(crate) enum RegistrySlotState<R: Resource> {
@@ -29,20 +109,21 @@ pub(crate) enum RegistrySlotState<R: Resource> {
     },
     Active {
         generation: u64,
-        entry: std::sync::Weak<Entry<R>>,
+        entry: Weak<Entry<R>>,
     },
 }
 
 impl<R: Resource> Default for Registry<R> {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            live: Mutex::new(HashMap::new()),
+            entries: DashMap::new(),
+            live: DashMap::new(),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum DomainPhase {
     Running,
     ShuttingDown,
@@ -50,18 +131,17 @@ pub(crate) enum DomainPhase {
 }
 
 struct Supervisor {
-    phase: DomainPhase,
     next_task: u64,
     tasks: HashMap<u64, ManagedTask>,
 }
-
 struct ManagedTask {
     control: Arc<Control>,
     abort: tokio::task::AbortHandle,
 }
 
 pub(crate) struct Domain {
-    registries: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    registries: DashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    phase: AtomicU8,
     supervisor: Mutex<Supervisor>,
     quiescent: Notify,
     pub(crate) shutdown: CancellationToken,
@@ -87,9 +167,9 @@ impl Drop for TaskFinalizer {
 impl Domain {
     pub(crate) fn new() -> Self {
         Self {
-            registries: Mutex::new(HashMap::new()),
+            registries: DashMap::new(),
+            phase: AtomicU8::new(DomainPhase::Running as u8),
             supervisor: Mutex::new(Supervisor {
-                phase: DomainPhase::Running,
                 next_task: 0,
                 tasks: HashMap::new(),
             }),
@@ -99,13 +179,15 @@ impl Domain {
     }
 
     pub(crate) fn registry<R: Resource>(&self) -> Arc<Registry<R>> {
-        let mut registries = self.registries.lock().unwrap();
-        registries
+        let erased = self
+            .registries
             .entry(TypeId::of::<R>())
-            .or_insert_with(|| Box::new(Arc::new(Registry::<R>::default())))
-            .downcast_ref::<Arc<Registry<R>>>()
+            .or_insert_with(|| Arc::new(Registry::<R>::default()))
+            .value()
+            .clone();
+        erased
+            .downcast::<Registry<R>>()
             .expect("a resource type has exactly one registry type")
-            .clone()
     }
 
     pub(crate) fn register(
@@ -113,8 +195,11 @@ impl Domain {
         control: Arc<Control>,
         abort: tokio::task::AbortHandle,
     ) -> Option<u64> {
-        let mut supervisor = self.supervisor.lock().unwrap();
-        if supervisor.phase != DomainPhase::Running || !control.activate() {
+        if !self.is_accepting() {
+            return None;
+        }
+        let mut supervisor = self.supervisor.lock();
+        if !self.is_accepting() || !control.activate() {
             return None;
         }
         let id = supervisor.next_task;
@@ -124,48 +209,62 @@ impl Domain {
     }
 
     pub(crate) fn task_finished(&self, id: u64) {
-        let terminated = {
-            let mut supervisor = self.supervisor.lock().unwrap();
-            supervisor.tasks.remove(&id);
-            if supervisor.phase == DomainPhase::ShuttingDown && supervisor.tasks.is_empty() {
-                supervisor.phase = DomainPhase::Terminated;
-                true
-            } else {
-                false
-            }
-        };
-        if terminated {
+        let mut supervisor = self.supervisor.lock();
+        supervisor.tasks.remove(&id);
+        #[cfg(feature = "tracing")]
+        tracing::trace!(task_id = id, "managed resource task finished");
+        if !self.is_accepting() && supervisor.tasks.is_empty() {
+            self.phase
+                .store(DomainPhase::Terminated as u8, Ordering::Release);
+            drop(supervisor);
             self.quiescent.notify_waiters();
         }
     }
 
     pub(crate) fn try_acquire<R: Resource>(&self, entry: &Arc<Entry<R>>) -> bool {
-        let supervisor = self.supervisor.lock().unwrap();
-        supervisor.phase == DomainPhase::Running && entry.control.acquire()
+        if !self.is_accepting() || !entry.control.is_active() {
+            return false;
+        }
+        self.is_accepting() && entry.control.is_active()
     }
 
     pub(crate) fn is_accepting(&self) -> bool {
-        self.supervisor.lock().unwrap().phase == DomainPhase::Running
+        self.phase.load(Ordering::Acquire) == DomainPhase::Running as u8
     }
 
     pub(crate) fn cancel(&self) {
-        let controls = {
-            let mut supervisor = self.supervisor.lock().unwrap();
-            if supervisor.phase == DomainPhase::Terminated {
-                return;
-            }
-            supervisor.phase = DomainPhase::ShuttingDown;
+        let supervisor = self.supervisor.lock();
+        if self
+            .phase
+            .compare_exchange(
+                DomainPhase::Running as u8,
+                DomainPhase::ShuttingDown as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                active_tasks = supervisor.tasks.len(),
+                "domain shutdown started"
+            );
             self.shutdown.cancel();
-            if supervisor.tasks.is_empty() {
-                supervisor.phase = DomainPhase::Terminated;
-                self.quiescent.notify_waiters();
-            }
-            supervisor
-                .tasks
-                .values()
-                .map(|task| task.control.clone())
-                .collect::<Vec<_>>()
-        };
+        }
+        if self.phase.load(Ordering::Acquire) == DomainPhase::Terminated as u8 {
+            return;
+        }
+        let controls = supervisor
+            .tasks
+            .values()
+            .map(|task| task.control.clone())
+            .collect::<Vec<_>>();
+        if supervisor.tasks.is_empty() {
+            self.phase
+                .store(DomainPhase::Terminated as u8, Ordering::Release);
+            self.quiescent.notify_waiters();
+        }
+        drop(supervisor);
         for control in controls {
             control.cancel();
         }
@@ -176,7 +275,6 @@ impl Domain {
         let aborts = self
             .supervisor
             .lock()
-            .unwrap()
             .tasks
             .values()
             .map(|task| task.abort.clone())
@@ -191,7 +289,7 @@ impl Domain {
         self.cancel();
         loop {
             let notified = self.quiescent.notified();
-            if self.supervisor.lock().unwrap().phase == DomainPhase::Terminated {
+            if self.phase.load(Ordering::Acquire) == DomainPhase::Terminated as u8 {
                 return;
             }
             notified.await;
@@ -200,6 +298,6 @@ impl Domain {
 
     #[cfg(test)]
     pub(crate) fn active_tasks(&self) -> usize {
-        self.supervisor.lock().unwrap().tasks.len()
+        self.supervisor.lock().tasks.len()
     }
 }

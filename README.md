@@ -81,7 +81,7 @@ impl Resource for Application {
 
     fn build((): ()) -> ResourceSpec<Self, Self::Error> {
         ResourceSpec::new(Self, |cx| async move {
-            let config = cx.get_or_spawn::<Configuration>("production".into())?;
+            let config = cx.get_or_spawn::<Configuration>("production".into()).await?;
             assert_eq!(config.environment, "production");
 
             // Observe shutdown without extending Configuration's lifetime.
@@ -102,7 +102,8 @@ runtime.shutdown().await;
 ```
 
 `Resource::build` is synchronous: it publishes the interface and defines the
-future that will drive it. Put ongoing work in the returned future. A panic in
+future that will drive it. It must therefore be short and non-blocking; put
+ongoing or blocking work in the returned future or use `cx.compute`. A panic in
 `build` is an acquisition error; a panic while polling the task is a terminal
 resource outcome.
 
@@ -165,15 +166,18 @@ The method communicates whether reuse is acceptable:
 |---|---|---:|---:|
 | `cx.spawn::<R>(input)` | Establish a new generation | yes | no |
 | `cx.get::<R>(&key)` | Retrieve an active canonical generation | no | yes |
-| `cx.get_or_spawn::<R>(input)` | Retrieve it or establish it | if absent | yes |
+| `cx.get_or_spawn::<R>(input).await` | Retrieve it or asynchronously wait to establish it | if absent | yes |
+| `cx.try_get_or_spawn::<R>(input)` | Retrieve or establish without waiting | if absent | yes |
 | `cx.status::<R>(&key)` | Observe absent, starting, or active state | no | active lease |
 | `cx.all::<R>()` | Snapshot all active generations of a type | no | active leases |
 
 `spawn` always creates for `Unique`. For `Singleton` and `Keyed`, it is
 create-only and returns `AcquireError::Occupied` when the identity is occupied.
 Concurrent `get_or_spawn` calls for one identity converge on a single generation.
+Waiting callers suspend rather than blocking a Tokio worker. `try_get_or_spawn`
+returns `AcquireError::Occupied` if another caller is constructing the identity.
 
-`get`, `status`, and `get_or_spawn` are available only for canonical placements.
+`get`, `status`, `get_or_spawn`, and `try_get_or_spawn` are available only for canonical placements.
 `all` also includes unique generations. Discovery storage is weak: it does not
 keep a resource alive, but every reference returned to the caller is a new strong
 lease.
@@ -223,7 +227,8 @@ The runtime offers three shutdown levels:
   quiescence. Aborted tasks report `ResourceOutcome::Aborted`.
 
 Once shutdown starts, the domain rejects new acquisition and weak-reference
-upgrades. These operations are idempotent.
+upgrades. Existing strong references can still be cloned because that does not
+perform a new registry acquisition. These operations are idempotent.
 
 ## One-shot blocking work
 

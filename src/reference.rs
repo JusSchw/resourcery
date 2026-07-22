@@ -38,6 +38,12 @@ pub(crate) struct Entry<R: Resource> {
     pub(crate) domain: Weak<Domain>,
 }
 
+impl<R: Resource> Drop for Entry<R> {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
 /// A strong lease on one resource generation.
 ///
 /// Cloning adds another lease to the same generation. Dropping the final lease
@@ -50,16 +56,9 @@ pub struct ResourceRef<R: Resource> {
 
 impl<R: Resource> Clone for ResourceRef<R> {
     fn clone(&self) -> Self {
-        self.entry.control.clone_lease();
         Self {
             entry: self.entry.clone(),
         }
-    }
-}
-
-impl<R: Resource> Drop for ResourceRef<R> {
-    fn drop(&mut self) {
-        self.entry.control.release();
     }
 }
 

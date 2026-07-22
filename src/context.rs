@@ -47,10 +47,7 @@ impl ResourceContext {
     /// Cancellation is cooperative: after this future resolves, the task should
     /// finish pending work as appropriate, release owned values, and return.
     pub async fn cancelled(&self) {
-        tokio::select! {
-            _ = self.cancellation.cancelled() => {},
-            _ = self.domain.shutdown.cancelled() => {},
-        }
+        self.cancellation.cancelled().await;
     }
 
     /// Runs synchronous work on Tokio's blocking thread pool.
@@ -70,10 +67,10 @@ impl ResourceContext {
     ///
     /// For [`Unique`](crate::Unique), every call creates an independent
     /// generation. For canonical placements, this is create-only and returns
-    /// [`AcquireError::Occupied`] if that identity is already active.
+    /// [`AcquireError::Occupied`] if that identity is starting or active.
     pub fn spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError> {
         if R::Placement::CANONICAL {
-            self.acquire_canonical::<R>(input, true)
+            self.spawn_canonical::<R>(input)
         } else {
             self.create_and_start::<R>(input, None)
         }
@@ -91,8 +88,8 @@ impl ResourceContext {
         R::Placement: CanonicalPlacement<R>,
     {
         let registry = self.domain.registry::<R>();
-        let slot = registry.entries.lock().unwrap().get(key)?.clone();
-        let state = slot.state.lock().unwrap();
+        let slot = registry.slot(key)?;
+        let state = slot.state.lock();
         let RegistrySlotState::Active { entry, .. } = &*state else {
             return None;
         };
@@ -116,10 +113,10 @@ impl ResourceContext {
         R::Placement: CanonicalPlacement<R>,
     {
         let registry = self.domain.registry::<R>();
-        let Some(slot) = registry.entries.lock().unwrap().get(key).cloned() else {
+        let Some(slot) = registry.slot(key) else {
             return ResourceStatus::Absent;
         };
-        let state = slot.state.lock().unwrap();
+        let state = slot.state.lock();
         match &*state {
             RegistrySlotState::Vacant => ResourceStatus::Absent,
             RegistrySlotState::Starting { .. } => ResourceStatus::Starting,
@@ -135,14 +132,39 @@ impl ResourceContext {
     /// Retrieves the active canonical generation or creates one when absent.
     ///
     /// Concurrent calls for the same identity converge on one generation.
+    /// Callers waiting for another constructor suspend without blocking a
+    /// runtime worker thread. [`Resource::build`] itself remains synchronous
+    /// and should be short and non-blocking.
     /// Input that is not represented in the placement key is used only by the
     /// caller that establishes a new generation; acquisition never implicitly
     /// reconfigures an existing one.
-    pub fn get_or_spawn<R: Resource>(&self, input: R::Input) -> Result<ResourceRef<R>, AcquireError>
+    pub async fn get_or_spawn<R: Resource>(
+        &self,
+        input: R::Input,
+    ) -> Result<ResourceRef<R>, AcquireError>
     where
         R::Placement: CanonicalPlacement<R>,
     {
-        self.acquire_canonical::<R>(input, false)
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
+            resource = std::any::type_name::<R>(),
+            "canonical acquisition"
+        );
+        self.acquire_canonical::<R>(input).await
+    }
+
+    /// Attempts to retrieve or establish a canonical generation without waiting.
+    ///
+    /// Returns [`AcquireError::Occupied`] when another caller is currently
+    /// constructing the identity.
+    pub fn try_get_or_spawn<R: Resource>(
+        &self,
+        input: R::Input,
+    ) -> Result<ResourceRef<R>, AcquireError>
+    where
+        R::Placement: CanonicalPlacement<R>,
+    {
+        self.try_acquire_canonical::<R>(input, false)
     }
 
     /// Acquires every currently active generation of resource type `R`.
@@ -152,13 +174,7 @@ impl ResourceContext {
     /// unspecified, and generations racing with this snapshot may be omitted.
     pub fn all<R: Resource>(&self) -> Vec<ResourceRef<R>> {
         let registry = self.domain.registry::<R>();
-        let entries = registry
-            .live
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let entries = registry.live_snapshot();
         entries
             .into_iter()
             .filter_map(|weak| {
@@ -172,7 +188,76 @@ impl ResourceContext {
             .collect()
     }
 
-    fn acquire_canonical<R: Resource>(
+    async fn acquire_canonical<R: Resource>(
+        &self,
+        input: R::Input,
+    ) -> Result<ResourceRef<R>, AcquireError>
+    where
+        R::Placement: CanonicalPlacement<R>,
+    {
+        if !self.domain.is_accepting() {
+            return Err(AcquireError::ShuttingDown);
+        }
+        let key = R::Placement::placement_key(&input);
+        let registry = self.domain.registry::<R>();
+        let (slot, mut owner) =
+            registry.slot_or_insert(key.clone(), || Arc::new(RegistrySlot::starting(1)));
+        let mut generation = 1;
+
+        while !owner {
+            let listener = slot.changed.listen();
+            let should_wait = {
+                let mut state = slot.state.lock();
+                match &*state {
+                    RegistrySlotState::Starting { .. } => true,
+                    RegistrySlotState::Vacant => {
+                        if !self.domain.is_accepting() {
+                            return Err(AcquireError::ShuttingDown);
+                        }
+                        generation = 1;
+                        *state = RegistrySlotState::Starting { generation };
+                        owner = true;
+                        false
+                    }
+                    RegistrySlotState::Active {
+                        generation: current,
+                        entry,
+                    } => {
+                        if let Some(entry) = entry.upgrade()
+                            && self.domain.try_acquire(&entry)
+                        {
+                            return Ok(ResourceRef { entry });
+                        }
+                        if !self.domain.is_accepting() {
+                            return Err(AcquireError::ShuttingDown);
+                        }
+                        generation = *current + 1;
+                        *state = RegistrySlotState::Starting { generation };
+                        owner = true;
+                        false
+                    }
+                }
+            };
+            if should_wait {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(
+                    resource = std::any::type_name::<R>(),
+                    "waiting for canonical construction"
+                );
+                listener.await;
+            }
+        }
+        self.finish_canonical_creation(input, key, registry, slot, generation)
+    }
+
+    fn spawn_canonical<R: Resource>(
+        &self,
+        input: R::Input,
+    ) -> Result<ResourceRef<R>, AcquireError> {
+        self.try_acquire_canonical::<R>(input, true)
+    }
+
+    fn try_acquire_canonical<R: Resource>(
         &self,
         input: R::Input,
         create_only: bool,
@@ -182,109 +267,79 @@ impl ResourceContext {
         }
         let key = R::Placement::placement_key(&input);
         let registry = self.domain.registry::<R>();
-        let (slot, mut owner) = {
-            let mut entries = registry.entries.lock().unwrap();
-            if let Some(slot) = entries.get(&key) {
-                (slot.clone(), false)
-            } else {
-                let generation = 1;
-                let slot = Arc::new(RegistrySlot {
-                    state: std::sync::Mutex::new(RegistrySlotState::Starting { generation }),
-                    changed: std::sync::Condvar::new(),
-                });
-                entries.insert(key.clone(), slot.clone());
-                (slot, true)
-            }
-        };
-
-        let mut state = slot.state.lock().unwrap();
-        while !owner {
+        let (slot, owner) =
+            registry.slot_or_insert(key.clone(), || Arc::new(RegistrySlot::starting(1)));
+        let generation = if owner {
+            1
+        } else {
+            let mut state = slot.state.lock();
             match &*state {
-                RegistrySlotState::Starting { .. } => state = slot.changed.wait(state).unwrap(),
-                RegistrySlotState::Vacant => {
-                    if !self.domain.is_accepting() {
-                        return Err(AcquireError::ShuttingDown);
-                    }
-                    let generation = 1;
-                    *state = RegistrySlotState::Starting { generation };
-                    owner = true;
-                }
+                RegistrySlotState::Starting { .. } => return Err(AcquireError::Occupied),
                 RegistrySlotState::Active { generation, entry } => {
                     if let Some(entry) = entry.upgrade()
                         && self.domain.try_acquire(&entry)
                     {
                         return if create_only {
-                            entry.control.release();
                             Err(AcquireError::Occupied)
                         } else {
                             Ok(ResourceRef { entry })
                         };
                     }
-                    if !self.domain.is_accepting() {
-                        return Err(AcquireError::ShuttingDown);
-                    }
-                    let generation = *generation + 1;
-                    *state = RegistrySlotState::Starting { generation };
-                    owner = true;
+                    let next = *generation + 1;
+                    *state = RegistrySlotState::Starting { generation: next };
+                    next
+                }
+                RegistrySlotState::Vacant => {
+                    *state = RegistrySlotState::Starting { generation: 1 };
+                    1
                 }
             }
-        }
-        let generation = match &*state {
-            RegistrySlotState::Starting { generation } => *generation,
-            _ => unreachable!(),
         };
-        drop(state);
+        self.finish_canonical_creation(input, key, registry, slot, generation)
+    }
+
+    fn finish_canonical_creation<R: Resource>(
+        &self,
+        input: R::Input,
+        key: <R::Placement as Placement<R>>::Key,
+        registry: Arc<Registry<R>>,
+        slot: Arc<RegistrySlot<R>>,
+        generation: u64,
+    ) -> Result<ResourceRef<R>, AcquireError> {
         let cleanup_registry = registry.clone();
         let cleanup_key = key.clone();
         let cleanup_slot = slot.clone();
         let resource = self.create::<R>(
             input,
             Some(Box::new(move || {
-                Self::remove_slot(
-                    &cleanup_registry,
-                    &cleanup_key,
-                    &cleanup_slot,
-                    Some(generation),
-                );
+                cleanup_registry.remove_if_same(&cleanup_key, &cleanup_slot, generation);
             })),
         );
         match resource {
             Ok((resource, start)) => {
-                let mut state = slot.state.lock().unwrap();
+                if !self.domain.is_accepting() {
+                    *slot.state.lock() = RegistrySlotState::Vacant;
+                    registry.remove_if_same(&key, &slot, generation);
+                    slot.changed.notify(usize::MAX);
+                    let _ = start.send(());
+                    return Err(AcquireError::ShuttingDown);
+                }
+                let mut state = slot.state.lock();
                 *state = RegistrySlotState::Active {
                     generation,
                     entry: Arc::downgrade(&resource.entry),
                 };
-                slot.changed.notify_all();
+                drop(state);
+                slot.changed.notify(usize::MAX);
                 let _ = start.send(());
                 Ok(resource)
             }
             Err(error) => {
-                *slot.state.lock().unwrap() = RegistrySlotState::Vacant;
-                Self::remove_slot(&registry, &key, &slot, Some(generation));
-                slot.changed.notify_all();
+                *slot.state.lock() = RegistrySlotState::Vacant;
+                registry.remove_if_same(&key, &slot, generation);
+                slot.changed.notify(usize::MAX);
                 Err(error)
             }
-        }
-    }
-
-    fn remove_slot<R: Resource>(
-        registry: &Registry<R>,
-        key: &<R::Placement as Placement<R>>::Key,
-        slot: &Arc<RegistrySlot<R>>,
-        generation: Option<u64>,
-    ) {
-        let mut entries = registry.entries.lock().unwrap();
-        if entries
-            .get(key)
-            .is_some_and(|present| Arc::ptr_eq(present, slot))
-            && generation.is_none_or(|expected| match &*slot.state.lock().unwrap() {
-                RegistrySlotState::Vacant => true,
-                RegistrySlotState::Starting { generation }
-                | RegistrySlotState::Active { generation, .. } => *generation == expected,
-            })
-        {
-            entries.remove(key);
         }
     }
 
@@ -306,9 +361,17 @@ impl ResourceContext {
         if !self.domain.is_accepting() {
             return Err(AcquireError::ShuttingDown);
         }
+        #[cfg(feature = "tracing")]
+        let build_started = std::time::Instant::now();
         let spec = catch_unwind(AssertUnwindSafe(|| R::build(input)))
             .map_err(|_| AcquireError::ConstructionPanicked)?;
-        let control = Arc::new(Control::new());
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            resource = std::any::type_name::<R>(),
+            elapsed = ?build_started.elapsed(),
+            "resource constructed"
+        );
+        let control = Arc::new(Control::new(self.domain.shutdown.child_token()));
         let (finished_tx, finished) = watch::channel(None);
         let entry = Arc::new(Entry {
             interface: spec.interface,
@@ -329,10 +392,7 @@ impl ResourceContext {
         };
         self.domain
             .registry::<R>()
-            .live
-            .lock()
-            .unwrap()
-            .insert(task_id, Arc::downgrade(&entry));
+            .insert_live(task_id, Arc::downgrade(&entry));
         let domain = self.domain.clone();
         tokio::spawn(async move {
             let _finalizer = TaskFinalizer::new(domain.clone(), task_id);
@@ -357,7 +417,7 @@ impl ResourceContext {
                 }
             }));
             let _ = finished_tx.send(Some(outcome));
-            domain.registry::<R>().live.lock().unwrap().remove(&task_id);
+            domain.registry::<R>().remove_live(task_id);
         });
         Ok((ResourceRef { entry }, start_tx))
     }
@@ -478,6 +538,7 @@ mod tests {
                 key: 1,
                 cancellations: cancellations.clone(),
             })
+            .await
             .unwrap();
         let first: ResourceCompletion<Infallible> = resource.completion();
         let second = first.clone();
@@ -509,14 +570,15 @@ mod tests {
         let (_, cx) = context();
         let cancellations = Arc::new(AtomicUsize::new(0));
         let mut joins = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..1_000 {
             let cx = cx.clone();
             let cancellations = cancellations.clone();
-            joins.push(tokio::task::spawn_blocking(move || {
+            joins.push(tokio::spawn(async move {
                 cx.get_or_spawn::<TestResource>(TestInput {
                     key: 7,
                     cancellations,
                 })
+                .await
                 .unwrap()
             }));
         }
@@ -541,6 +603,7 @@ mod tests {
                 key: 9,
                 cancellations: old_cancel,
             })
+            .await
             .unwrap();
         let old_done = old.completion();
         drop(old);
@@ -549,20 +612,13 @@ mod tests {
                 key: 9,
                 cancellations: Arc::new(AtomicUsize::new(0)),
             })
+            .await
             .unwrap();
         old_done.wait().await;
         assert_eq!(cx.get::<TestResource>(&9).unwrap().0, replacement.0);
         drop(replacement);
         domain.shutdown().await;
-        assert_eq!(
-            domain
-                .registry::<TestResource>()
-                .entries
-                .lock()
-                .unwrap()
-                .len(),
-            0
-        );
+        assert_eq!(domain.registry::<TestResource>().entries_len(), 0);
         assert_eq!(domain.active_tasks(), 0);
     }
 
@@ -575,19 +631,13 @@ mod tests {
                     key: generation,
                     cancellations: Arc::new(AtomicUsize::new(0)),
                 })
+                .await
                 .unwrap();
             let completion = resource.completion();
             drop(resource);
             completion.wait().await;
         }
-        assert!(
-            domain
-                .registry::<TestResource>()
-                .entries
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(domain.registry::<TestResource>().entries_is_empty());
         assert_eq!(domain.active_tasks(), 0);
     }
 
@@ -599,6 +649,7 @@ mod tests {
                 key: 11,
                 cancellations: Arc::new(AtomicUsize::new(0)),
             })
+            .await
             .unwrap();
         domain.shutdown().await;
         assert!(matches!(
@@ -609,7 +660,8 @@ mod tests {
             cx.get_or_spawn::<TestResource>(TestInput {
                 key: 12,
                 cancellations: Arc::new(AtomicUsize::new(0)),
-            }),
+            })
+            .await,
             Err(AcquireError::ShuttingDown)
         ));
         domain.shutdown().await;
@@ -638,12 +690,12 @@ mod tests {
         drop(clone);
 
         let cancelling = cx.spawn::<StuckResource>(()).unwrap();
-        assert_eq!(cancelling.entry.control.leases(), 1);
+        assert_eq!(Arc::strong_count(&cancelling.entry), 1);
         domain.cancel();
         let clone = cancelling.clone();
-        assert_eq!(cancelling.entry.control.leases(), 2);
+        assert_eq!(Arc::strong_count(&cancelling.entry), 2);
         assert!(cancelling.downgrade().upgrade().is_none());
-        assert_eq!(cancelling.entry.control.leases(), 2);
+        assert_eq!(Arc::strong_count(&cancelling.entry), 2);
         drop((cancelling, clone));
         domain.terminate().await;
     }
@@ -667,7 +719,7 @@ mod tests {
             let cx = cx.clone();
             let barrier = barrier.clone();
             tokio::task::spawn_blocking(move || {
-                cx.get_or_spawn::<StartingResource>(barrier).unwrap()
+                cx.try_get_or_spawn::<StartingResource>(barrier).unwrap()
             })
         };
         barrier.wait();
@@ -684,11 +736,11 @@ mod tests {
         drop(resource);
     }
 
-    #[test]
-    fn construction_panic_restores_absent_slot() {
+    #[tokio::test]
+    async fn construction_panic_restores_absent_slot() {
         let (_, cx) = context();
         assert!(matches!(
-            cx.get_or_spawn::<ConstructionPanic>(()),
+            cx.get_or_spawn::<ConstructionPanic>(()).await,
             Err(AcquireError::ConstructionPanicked)
         ));
         assert!(matches!(
@@ -704,7 +756,7 @@ mod tests {
         let spawning = {
             let cx = cx.clone();
             let barrier = barrier.clone();
-            tokio::task::spawn_blocking(move || cx.get_or_spawn::<StartingResource>(barrier))
+            tokio::task::spawn_blocking(move || cx.try_get_or_spawn::<StartingResource>(barrier))
         };
         barrier.wait();
         domain.cancel();
@@ -717,6 +769,54 @@ mod tests {
             cx.status::<StartingResource>(&()),
             ResourceStatus::Absent
         ));
+        domain.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_key_waiters_do_not_block_runtime_workers() {
+        let (domain, cx) = context();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let owner = {
+            let cx = cx.clone();
+            let barrier = barrier.clone();
+            tokio::task::spawn_blocking(move || {
+                cx.try_get_or_spawn::<StartingResource>(barrier).unwrap()
+            })
+        };
+        barrier.wait();
+
+        let mut waiters = Vec::new();
+        for _ in 0..64 {
+            let cx = cx.clone();
+            let barrier = barrier.clone();
+            waiters.push(tokio::spawn(async move {
+                cx.get_or_spawn::<StartingResource>(barrier).await.unwrap()
+            }));
+        }
+
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+        let heartbeat_task = {
+            let heartbeat = heartbeat.clone();
+            tokio::spawn(async move {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                    heartbeat.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        timeout(Duration::from_secs(1), heartbeat_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(heartbeat.load(Ordering::SeqCst), 10);
+
+        barrier.wait();
+        let resource = owner.await.unwrap();
+        for waiter in waiters {
+            let acquired = waiter.await.unwrap();
+            assert!(Arc::ptr_eq(&acquired.entry, &resource.entry));
+        }
+        drop(resource);
         domain.shutdown().await;
     }
 
