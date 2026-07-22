@@ -230,16 +230,6 @@ Once shutdown starts, the domain rejects new acquisition and weak-reference
 upgrades. Existing strong references can still be cloned because that does not
 perform a new registry acquisition. These operations are idempotent.
 
-## One-shot blocking work
-
-Use `cx.compute(move || value)` for one synchronous or CPU-heavy operation. It
-runs on Tokio's blocking pool, produces a `JoinError` if the blocking task fails,
-has no identity, and does not enter the resource graph. Cancellation of the
-awaiting resource does not stop blocking work that has already begun.
-
-Use a resource instead when work is long-lived, shared, addressable, observable,
-stateful, or owns other managed dependencies.
-
 ## API guide
 
 - `Resource` binds interface, `Input`, `Error`, `Placement`, and construction.
@@ -248,7 +238,7 @@ stateful, or owns other managed dependencies.
 - `WeakResourceRef<R>` is non-owning access that may be upgraded while active.
 - `ResourceCompletion<E>` observes termination without retaining liveness.
 - `ResourceOutcome<E>` describes the immutable terminal result.
-- `ResourceContext` provides acquisition, discovery, cancellation, and compute.
+- `ResourceContext` provides resource acquisition, discovery, and cancellation.
 - `ResourceRuntime` owns the domain and coordinates root execution and shutdown.
 - `Unique`, `Singleton`, and `Keyed<K>` define placement and identity.
 - `AcquireError` reports creation/acquisition failures; `RunError<E>` reports a

@@ -16,9 +16,9 @@ use crate::{
 
 /// An owned capability passed to a managed resource task.
 ///
-/// A context provides access to the shared resource domain, the current
-/// generation's cancellation signal, and blocking computation. Cloning a
-/// context does not create a resource lease.
+/// A context provides access to the shared resource domain and the current
+/// generation's cancellation signal. Cloning a context does not create a
+/// resource lease.
 #[derive(Clone)]
 pub struct ResourceContext {
     domain: Arc<Domain>,
@@ -73,19 +73,6 @@ impl ResourceContext {
     /// finish pending work as appropriate, release owned values, and return.
     pub async fn cancelled(&self) {
         self.cancellation.cancelled().await;
-    }
-
-    /// Runs synchronous work on Tokio's blocking thread pool.
-    ///
-    /// Computations have no resource identity and do not enter the dependency
-    /// graph. Dropping or cancelling the awaiting task does not stop blocking
-    /// work that has already started.
-    pub async fn compute<F, T>(&self, work: F) -> Result<T, tokio::task::JoinError>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        tokio::task::spawn_blocking(work).await
     }
 
     /// Creates a new resource generation.
