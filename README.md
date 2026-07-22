@@ -93,12 +93,13 @@ impl Resource for Application {
     }
 }
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let runtime = ResourceRuntime::new();
-runtime.run::<Application>(()).await?;
-runtime.shutdown().await;
-# Ok(())
-# }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = ResourceRuntime::new();
+    runtime.run::<Application>(()).await?;
+    runtime.shutdown().await;
+    Ok(())
+}
 ```
 
 `Resource::build` is asynchronous, so construction can await initialization
